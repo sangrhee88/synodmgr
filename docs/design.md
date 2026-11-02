@@ -23,7 +23,7 @@ Synod Manager does for a Synod RAC fleet what Enterprise Manager, srvctl and DBC
 | Oracle | Synod Manager | Built on (exists today unless marked new) |
 | --- | --- | --- |
 | Cloud Control console | Web console: fleet, cluster, writer and storage pages | cplane API (`/v1/clusters/{name}`, `/v1/hosts`, `/v1/events`) |
-| Management Agent | Collectors on every machine | Page server and log server `/metrics`; new: `node_exporter` per machine, one SQL exporter per writer |
+| Management Agent | Collectors on every machine | Page server and log server `/metrics`; new: `node_exporter` per machine, writer metrics on each host agent's /metrics |
 | Repository (OMR) | Manager's own Postgres for inventory, users, audit log and alert state; a metrics store for time series | New |
 | srvctl, crsctl | `synodmgr` CLI | cplane API: split, relocate, settings, restore points |
 | DBCA | Create-cluster flow in the console and CLI | `POST /v1/clusters`, then `POST .../split` |
@@ -90,7 +90,7 @@ flowchart TB
   end
   subgraph inst["Synod installation"]
     cp["cplane + standby<br/>HTTP API, events, /metrics (new)"]
-    wr["Writers<br/>Postgres + synod, SQL exporter (new)"]
+    wr["Writers<br/>Postgres + synod, metrics via the host agent (new)"]
     st["Storage servers<br/>log and page servers, /metrics (today)"]
     em["Every machine<br/>node_exporter (new)"]
   end
@@ -119,8 +119,8 @@ Milestone 1 ships seven web console pages, plus the CLI's read commands on the s
 | --- | --- | --- |
 | Fleet | Every cluster and single-writer database: writers up or evicted, control plane leader and standby, open alerts, last restore point | cplane `GET /v1/clusters/{name}`, `/v1/databases`, `/v1/hosts`, `/v1/leader`, restore points |
 | Cluster | Slots and their writers (host, address, state), sharing and table groups, settings, storage layout, restore points, the cluster's event timeline | cplane API; events filtered to the cluster |
-| Writer | Commits per second, connections and pooler use, commit wait for the log servers, block service busy time, CPU, memory and disk; where each writer's time goes, from the block service's timers | SQL exporter on the writer; `node_exporter` |
-| Cache Fusion | Per writer, per second: blocks shipped and received, grants asked of the other writers, waits for other writers' transactions, cross-writer deadlocks, full images logged, slow block service turns | `synod.share_stats()` through the SQL exporter |
+| Writer | Commits per second, connections and pooler use, commit wait for the log servers, block service busy time, CPU, memory and disk; where each writer's time goes, from the block service's timers | The host agent's /metrics; `node_exporter` |
+| Cache Fusion | Per writer, per second: blocks shipped and received, grants asked of the other writers, waits for other writers' transactions, cross-writer deadlocks, full images logged, slow block service turns | `synod.share_stats()` through the host agent's /metrics |
 | Sessions and waits | Live list of every writer's sessions, plus a history of wait events sampled every 10 s, like Oracle's ASH | `synod.cluster_stat_activity` |
 | Storage | Log servers (commit lag, flush time), page servers (page read latency, WAL ingest lag, upload backlog to S3), disk space | Page server and log server `/metrics`; `node_exporter` |
 | Events | One timeline of failovers, evictions, moves, setting changes and restore points across every installation; each failover and eviction explained step by step | cplane `/v1/events` |
@@ -206,7 +206,7 @@ Thirteen small changes, none on the commit or page path. Each is read-only or a 
 | cplane | `GET /v1/events?after=<id>&database=<name>`; today it only returns the newest N | 1 |
 | cplane | `GET /metrics`: leader and standby, each host's heartbeat age, writers by state, events counted by kind | 1 |
 | cplane | Report its version and API level (in `/v1/leader` or a new `/v1/version`), so the manager knows which actions a cluster supports | 1 |
-| agent | Run a SQL exporter next to each writer, like the pooler: started and stopped with the compute, reading over the local socket, on a free port in the writer's block of 10 (the pooler uses +5) | 1 |
+| agent | Serve every writer's metrics on the agent's own /metrics: read-only queries over each compute's local socket at scrape time; the start request carries the cluster's database name | 1 |
 | installer | `node_exporter` on every machine; a `manager` role in the inventory; open the exporter ports to the manager machine | 1 |
 | extension | A `synod_monitor` role created at install with `pg_monitor` (for other users' query text) | 1 |
 | extension | `synod.hot_blocks(n)`: the most-requested blocks with table name and grant counts; `share_block_info` today needs a table and block number | 2 |
@@ -216,7 +216,7 @@ Thirteen small changes, none on the commit or page path. Each is read-only or a 
 | cplane | Token rotation without restarting cplane | 2 |
 | extension | Per-table counters of blocks moved between writers | 2 |
 
-The SQL exporter reuses what's already in the fork: Neon's collector definitions in `compute/etc/sql_exporter/` (local file cache, page reads stuck, backpressure, current LSN). The installer doesn't ship an exporter binary today. The Synod collectors are added beside them: `share_stats` counters, `pg_stat_database` commits and rollbacks, and wait-event counts from `cluster_stat_activity`.
+The agent reuses the SQL already in the fork, in `compute/etc/sql_exporter/` (local file cache, page-read waits, backpressure, LSNs). Synod's own queries sit beside it: `share_stats` counters and timers, `pg_stat_database` totals, and active sessions by wait event from each writer's own `pg_stat_activity`, so no scrape asks another writer anything. A separate read-only metrics token guards `/metrics` on agents and control planes. No third-party exporter runs next to the writers: the agent already has a connection path to each one, and one less binary means one less thing to ship and to vet.
 
 By the standing rule, the agent change is the only one that touches a running writer's machine. It gets the full correctness suite (backup, restore, standby, logical replication, storage split) before merging.
 
@@ -241,7 +241,6 @@ Every piece shipped is under a permissive license, so the manager can be sold in
 | --- | --- | --- |
 | [VictoriaMetrics](https://pkg.go.dev/github.com/VictoriaMetrics/VictoriaMetrics@v1.141.0-cluster) (single node), vmalert | Metrics store and scraping; alert rules | Apache 2.0 |
 | Prometheus Alertmanager, `node_exporter` | Alert routing; host metrics | Apache 2.0 |
-| [sql_exporter](https://github.com/burningalchemist/sql_exporter) | Per-writer SQL metrics, the tool Neon's collector files are written for | MIT |
 | [Perses](https://github.com/perses/perses) panels (npm packages) | Charts inside the console | Apache 2.0 |
 | PostgreSQL 17 | The manager's own state | PostgreSQL License |
 
@@ -257,8 +256,8 @@ Deliberately left out:
 Milestone 1 is about three weeks of work by my estimate; milestones 2 and 3 about two to three weeks each. Sizes are rough until the first step is done.
 
 1. **cplane read endpoints** (about 2 days): cluster list, events after an id, `/metrics`. Unit tests in `cplane`. Done Nov 1 on branch `manager-api` of synod-storage (built on `pooler`, not merged): unit and store tests pass, and 27 of 27 end-to-end checks with a leader and a standby.
-2. **Collectors** (about 3 days): the agent runs a SQL exporter per writer with Neon's and the new Synod collectors; the installer adds `node_exporter`, the `manager` role and the `synod_monitor` role. Then the local correctness suite, since this is the one change on writer machines.
-3. **Manager core** (about 4 days): API, its own database (installations, users, tokens, audit log), VictoriaMetrics with targets taken from cplane.
+2. **Collectors** (about 3 days): the host agent serves every writer's metrics; the installer adds Ubuntu's `node_exporter`, the metrics token and a `targets` command. The `manager` role and the `synod_monitor` role move to step 3, where the manager first needs them. Then the local correctness suite, since this is the one change on writer machines.
+3. **Manager core** (about 4 days): API, its own database (installations, users, tokens, audit log), VictoriaMetrics with targets taken from cplane. Also the installer's manager role and the synod_monitor role, moved here from step 2.
 4. **Console and CLI** (about 1 to 1.5 weeks): the seven pages, and `synodmgr` read commands (`status`, `clusters`, `events`, `sessions`).
 5. **Test locally**: a three-writer cluster from `local3-run.sh`, then the existing fault tests (kill, freeze, network split, machine loss), checking that each shows on the Events and Cluster pages within 10 s.
 6. **Test on AWS** (asks you first; it costs money): one run on the 7-machine layout to measure the exporters' cost to throughput with the warm-cache benchmark, and to size the manager machine. Results collected before teardown; machines terminated and counted to 0.
@@ -268,7 +267,7 @@ Milestone 1 is about three weeks of work by my estimate; milestones 2 and 3 abou
 
 ## Risks and questions for you
 
-The main risk is the exporters slowing the writers. `share_stats` reads counters in memory, but `cluster_stat_activity` asks every writer, so it is sampled every 10 s and measured in step 6. If the exporters cost more than 1% of throughput, the sampling slows down until they don't.
+The main risk is the metrics queries slowing the writers. They read counters in memory and each writer's own sessions, never another writer's, and their cost is measured in step 6. If they cost more than 1% of throughput, scrapes get less frequent until they don't.
 
 Other risks:
 
@@ -282,4 +281,4 @@ Questions before code starts, answered Nov 1:
 - [x] Is the manager in the paid product only, or also in a free Community edition? Marketplace allows a free edition only beside a paid one. Answer: both, a free Community edition beside the paid one (split proposed under Packaging).
 - [x] Which alert destinations and sign-in provider does the first design partner use (Slack, PagerDuty, email; Okta, Entra ID)? Answer: Slack and email for alerts. The sign-in provider is still open; OIDC covers the common ones.
 - [x] Is a Synod-hosted cloud a 2027 goal, or customer-hosted only for now? Answer: yes, a 2027 goal.
-- [x] OK to run a SQL exporter next to every writer? It is the only change on writer machines. Answer: yes, so each writer's performance shows on its own.
+- [x] OK to collect metrics next to every writer? It is the only change on writer machines. Answer: yes, so each writer's performance shows on its own.
