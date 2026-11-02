@@ -1,5 +1,5 @@
 //! Background work: copying every installation's control plane events (every 5 s, by the machine
-//! holding the background lease when there are two), and keeping the
+//! holding the background lease when there are two), the fleet copy (every 10 s), and keeping the
 //! metrics store's scrape configuration in step with the installations and their hosts (every
 //! 60 s). Sessions past their end are removed too, and a backup is made every night when
 //! `[backup] dir` is set.
@@ -52,15 +52,28 @@ pub fn spawn_all(app: App) {
             }
         }
     });
+    // the fleet copy, and the scrape list from it: on every machine (each scrapes for itself)
+    let a = app.clone();
+    tokio::spawn(async move {
+        let mut t = tokio::time::interval(crate::fleet::EVERY);
+        t.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            t.tick().await;
+            match crate::fleet::refresh_all(&a).await {
+                Ok(d) if d > crate::fleet::EVERY => warn!("fleet: a refresh took {:.1} s", d.as_secs_f64()),
+                Ok(_) => {}
+                Err(e) => warn!("fleet: {e:#}"),
+            }
+            if let Err(e) = write_scrape_config(&a).await {
+                warn!("scrape configuration: {e:#}");
+            }
+        }
+    });
     let a = app.clone();
     tokio::spawn(async move {
         let mut t = tokio::time::interval(Duration::from_secs(60));
         loop {
             t.tick().await;
-            // every machine scrapes for itself: its own metrics store, its own list
-            if let Err(e) = write_scrape_config(&a).await {
-                warn!("scrape configuration: {e:#}");
-            }
             if a.leader.load(Ordering::SeqCst) {
                 if let Err(e) = prune_sessions(&a).await {
                     warn!("sessions: {e:#}");
@@ -80,6 +93,8 @@ pub fn parse_event_time(s: &str) -> Option<DateTime<Utc>> {
 
 /// Installations whose events are copied at once.
 pub const EVENT_COPIES_AT_ONCE: usize = 16;
+/// Time one installation gets per round of copying.
+pub const EVENT_COPY_TIMEOUT: Duration = Duration::from_secs(4);
 
 /// Every installation's new events, up to `EVENT_COPIES_AT_ONCE` installations at a time (one
 /// slow or unreachable control plane doesn't hold up the others).
@@ -90,8 +105,12 @@ pub async fn copy_events(app: &App) -> Result<()> {
         let (a, l) = (app.clone(), limit.clone());
         set.spawn(async move {
             let _p = l.acquire_owned().await;
-            if let Err(e) = copy_events_of(&a, &inst).await {
-                warn!(installation = %inst.name, "events: {e:#}");
+            // a control plane that doesn't answer holds up only itself: what was copied is kept,
+            // the rest comes in the next round
+            match tokio::time::timeout(EVENT_COPY_TIMEOUT, copy_events_of(&a, &inst)).await {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => warn!(installation = %inst.name, "events: {e:#}"),
+                Err(_) => warn!(installation = %inst.name, "events: no answer within {} s", EVENT_COPY_TIMEOUT.as_secs()),
             }
         });
     }
@@ -135,25 +154,22 @@ pub async fn copy_events_of(app: &App, inst: &Installation) -> Result<usize> {
     }
 }
 
-/// host:port of a URL.
-fn host_port(url: &str) -> Option<String> {
-    let rest = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
-    let hp = rest.split('/').next()?;
-    if hp.is_empty() { None } else { Some(hp.to_string()) }
-}
 
 /// The metrics store's scrape configuration (Prometheus format, which VictoriaMetrics reads with
 /// -promscrape.config and re-reads every 30 s): per installation, its control plane front door
 /// and every host agent (both want the metrics token), plus the installation's static targets
 /// (`synod-install targets`: storage servers, node exporters). Every target carries the
 /// installation's name as a label.
-pub fn scrape_config(insts: &[(Installation, Vec<String>)], token_dir: &std::path::Path) -> String {
+/// Storage histograms kept when `[scrape] storage_histograms` is off.
+pub const STORAGE_HISTOGRAMS_KEPT: &str = "pageserver_smgr_query_seconds_global_bucket";
+
+pub fn scrape_config(insts: &[(Installation, Vec<String>)], token_dir: &std::path::Path, storage_histograms: bool) -> String {
     let mut jobs = Vec::new();
     for (inst, agents) in insts {
         let token_file = token_dir.join(format!("{}.metrics_token", inst.name));
         let labels = json!({ "installation": inst.name });
         if inst.has_metrics_token {
-            if let Some(fd) = host_port(&inst.front_door) {
+            if let Some(fd) = cplane::host_port(&inst.front_door) {
                 jobs.push(json!({
                     "job_name": format!("{}-cplane", inst.name),
                     "scrape_interval": "15s",
@@ -188,6 +204,10 @@ pub fn scrape_config(insts: &[(Installation, Vec<String>)], token_dir: &std::pat
             if let Some(p) = g.pointer("/labels/__metrics_path__").and_then(Value::as_str) {
                 j["metrics_path"] = json!(p);
             }
+            if !storage_histograms && job.starts_with("synod_") {
+                j["metric_relabel_configs"] = json!([{ "action": "drop",
+                    "if": format!("{{__name__=~\".+_bucket\", __name__!~\"{STORAGE_HISTOGRAMS_KEPT}\"}}") }]);
+            }
             jobs.push(j);
         }
     }
@@ -198,26 +218,21 @@ pub fn scrape_config(insts: &[(Installation, Vec<String>)], token_dir: &std::pat
 pub async fn write_scrape_config(app: &App) -> Result<()> {
     let insts = cplane::installations(app).await?;
     let token_dir = app.cfg.data_dir.join("tokens");
+    // the host agents from the fleet copy (its last good hosts list)
+    let fleet = app.fleet.all().await;
     let mut with_agents = Vec::new();
     for inst in insts {
-        let agents = match cplane::get_json(app, &inst.front_door, &inst.admin_token, "/v1/hosts").await {
-            Ok(v) => v
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter_map(|h| h.get("agent_url").and_then(Value::as_str).and_then(host_port))
-                .collect(),
-            Err(e) => {
-                warn!(installation = %inst.name, "hosts: {e:#}");
-                Vec::new()
-            }
-        };
+        let agents = fleet.get(&inst.id).map(|s| s.agents()).unwrap_or_default();
         if inst.has_metrics_token {
-            write_private(&token_dir.join(format!("{}.metrics_token", inst.name)), inst.metrics_token.as_bytes())?;
+            // written only when it changed (every 10 s for hundreds of installations otherwise)
+            let f = token_dir.join(format!("{}.metrics_token", inst.name));
+            if std::fs::read(&f).ok().as_deref() != Some(inst.metrics_token.as_bytes()) {
+                write_private(&f, inst.metrics_token.as_bytes())?;
+            }
         }
         with_agents.push((inst, agents));
     }
-    let text = scrape_config(&with_agents, &token_dir);
+    let text = scrape_config(&with_agents, &token_dir, app.cfg.scrape.storage_histograms);
     let path = app.cfg.data_dir.join("scrape.yml");
     if std::fs::read_to_string(&path).ok().as_deref() != Some(text.as_str()) {
         write_private(&path, text.as_bytes())?;
@@ -282,6 +297,7 @@ mod tests {
         let cfg = scrape_config(
             &[(inst("prod", true, extra), vec!["10.0.0.8:3300".into(), "10.0.0.9:3300".into()])],
             std::path::Path::new("/var/lib/synodmgr/tokens"),
+            false,
         );
         let v: Value = serde_json::from_str(&cfg).unwrap();
         let jobs = v["scrape_configs"].as_array().unwrap();
@@ -291,10 +307,14 @@ mod tests {
         assert_eq!(jobs[1]["bearer_token_file"], "/var/lib/synodmgr/tokens/prod.metrics_token");
         assert_eq!(jobs[1]["static_configs"][0]["labels"]["installation"], "prod");
         assert!(jobs[2].get("bearer_token_file").is_none());
+        // storage histograms dropped but the page server's read latency
+        let rule = jobs[2]["metric_relabel_configs"][0]["if"].as_str().unwrap();
+        assert!(rule.contains(".+_bucket") && rule.contains(STORAGE_HISTOGRAMS_KEPT), "{rule}");
+        assert!(jobs[1].get("metric_relabel_configs").is_none(), "agents keep everything");
         // without a metrics token: only the static targets
-        let cfg = scrape_config(&[(inst("dev", false, json!([])), vec!["h:1".into()])], std::path::Path::new("/t"));
+        let cfg = scrape_config(&[(inst("dev", false, json!([])), vec!["h:1".into()])], std::path::Path::new("/t"), true);
         assert_eq!(serde_json::from_str::<Value>(&cfg).unwrap()["scrape_configs"].as_array().unwrap().len(), 0);
-        assert_eq!(host_port("http://10.0.0.8:3300/x"), Some("10.0.0.8:3300".into()));
+        assert_eq!(cplane::host_port("http://10.0.0.8:3300/x"), Some("10.0.0.8:3300".into()));
     }
 }
 

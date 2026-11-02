@@ -37,6 +37,17 @@ pub struct Config {
     pub passwords: PasswordConfig,
     #[serde(default)]
     pub backup: BackupConfig,
+    #[serde(default)]
+    pub scrape: ScrapeConfig,
+}
+
+#[derive(Deserialize, Debug, Clone, Default)]
+#[serde(deny_unknown_fields, default)]
+pub struct ScrapeConfig {
+    /// Keep every histogram of the storage servers (page servers, log servers, storage
+    /// controller). Off: only the page server's read latency histogram; the others are about
+    /// half of a page server's series and nothing in the console uses them.
+    pub storage_histograms: bool,
 }
 
 #[derive(Deserialize, Debug, Clone)]

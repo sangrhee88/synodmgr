@@ -45,6 +45,7 @@ async fn start(tag: &str) -> Option<Env> {
         sessions: SessionConfig::default(),
         passwords: PasswordConfig::default(),
         backup: Default::default(),
+        scrape: Default::default(),
     };
     let app = AppState::new(cfg).unwrap();
     db::migrate(&app.db).await.unwrap();

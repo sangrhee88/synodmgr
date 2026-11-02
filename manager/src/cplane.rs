@@ -58,6 +58,13 @@ pub async fn installation(app: &App, name: &str) -> Result<Option<Installation>>
     Ok(installations(app).await?.into_iter().find(|i| i.name == name))
 }
 
+/// host:port of a URL.
+pub fn host_port(url: &str) -> Option<String> {
+    let rest = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
+    let hp = rest.split('/').next()?;
+    if hp.is_empty() { None } else { Some(hp.to_string()) }
+}
+
 fn url(front_door: &str, path: &str) -> String {
     format!("{}{}", front_door.trim_end_matches('/'), path)
 }

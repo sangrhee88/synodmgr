@@ -113,6 +113,7 @@ CREATE TABLE IF NOT EXISTS events (
     PRIMARY KEY (installation, id)
 );
 CREATE INDEX IF NOT EXISTS events_at ON events (at DESC);
+CREATE INDEX IF NOT EXISTS events_installation_at ON events (installation, at DESC);
 
 -- Work only one manager machine may do at a time (copying events, removing old sessions): the
 -- machine holding the lease does it, renewing it every few seconds; times are the database's.

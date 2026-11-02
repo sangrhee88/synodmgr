@@ -26,6 +26,12 @@ Milestone 1, step 3 of the order of work: the manager service, without the conso
   everything into its own metrics store; copying events and removing old sessions is done by the
   machine holding a lease in the repository (`manager/src/lease.rs`: 15 s, renewed every 5 s, given up
   on a clean stop), so losing either machine loses neither the console nor the metrics.
+- Scale: the fleet view comes from a copy each machine refreshes every 10 s (16 control planes at a
+  time, 8 s each; failing ones retried every 30 s in their own lane), events are copied 16
+  installations at a time, and the storage servers' histograms are dropped from scraping except the
+  page server's read latency (`[scrape] storage_histograms`): a real installation of 3 writers is
+  about 4,500 series instead of 8,600. Load test (`manager/examples/fakefleet.rs`,
+  `manager_scale_check.py`): 300 installations, 900 clusters, two machines, see the results.
 - `synodmgr-admin` on the manager machine: `init-admin`, `reset-password`, `verify-audit`,
   `add-installation`, `backup`, `backups`, `restore FILE`.
 - `synod-install` (sangrhee88/stage3-neon-m1, branch `manager`) installs it as role `manager`.
@@ -49,7 +55,9 @@ checked by `installer/test/manager_check.py`, `manager_failover.py` (the reposit
 
 - `manager/src/config.rs` the configuration file (`/etc/synodmgr/manager.toml`, written by the installer)
 - `manager/src/db.rs` the repository schema
-- `manager/src/backup.rs` backups and restore; `lease.rs` the background lease (two machines)
+- `manager/src/backup.rs` backups and restore; `lease.rs` the background lease (two machines);
+  `fleet.rs` the fleet copy
+- `manager/examples/fakefleet.rs` a simulated fleet for load tests
 - `manager/src/auth.rs`, `passwords.rs`, `users.rs` sign-in, sessions, accounts
 - `manager/src/audit.rs` the audit log
 - `manager/src/cplane.rs` the control plane client; `tasks.rs` events and scrape configuration

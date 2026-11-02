@@ -419,6 +419,9 @@ async fn add_installation(
         return Err(ApiError(StatusCode::CONFLICT, format!("An installation {} exists.", req.name)));
     }
     app.audit.append(Entry { result: "ok".into(), request, ..p.entry("installation_add", &req.name) }).await?;
+    if let Some(inst) = cplane::installation(&app, &req.name).await? {
+        crate::fleet::refresh_one(&app, &inst).await;
+    }
     if let Err(e) = crate::tasks::write_scrape_config(&app).await {
         tracing::warn!("scrape configuration: {e:#}");
     }
@@ -444,45 +447,24 @@ async fn remove_installation(
     Ok(Json(json!({ "ok": true })))
 }
 
-/// Every installation: its control planes, clusters (slots, writers), hosts and each cluster's
-/// newest restore point. An installation that doesn't answer is listed with its error.
-async fn fleet(State(app): State<App>, ConnectInfo(addr): ConnectInfo<SocketAddr>, method: Method, headers: HeaderMap) -> ApiResult<Json<Value>> {
+#[derive(Deserialize)]
+struct FleetQuery {
+    installation: Option<String>,
+}
+
+/// Every installation (or `?installation=`): its control planes, clusters (slots, writers), hosts
+/// and each cluster's newest restore point, from the copy refreshed every 10 s (`as_of`, `age_s`).
+/// An installation that doesn't answer is listed with its error.
+async fn fleet(
+    State(app): State<App>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    method: Method,
+    headers: HeaderMap,
+    Query(q): Query<FleetQuery>,
+) -> ApiResult<Json<Value>> {
     let p = who(&app, &headers, &method, addr).await?;
     p.ready()?;
-    let mut out = Vec::new();
-    for inst in cplane::installations(&app).await? {
-        let (fd, tok) = (inst.front_door.clone(), inst.admin_token.clone());
-        let (leader, clusters, hosts) = tokio::join!(
-            cplane::get_json(&app, &fd, &tok, "/v1/leader"),
-            cplane::get_json(&app, &fd, &tok, "/v1/clusters"),
-            cplane::get_json(&app, &fd, &tok, "/v1/hosts"),
-        );
-        let ages = if inst.has_metrics_token {
-            cplane::get_text(&app, &fd, &inst.metrics_token, "/metrics").await.map(|t| cplane::restore_point_ages(&t)).ok()
-        } else {
-            None
-        };
-        let mut clusters = clusters.map_err(|e| format!("{e:#}"));
-        if let (Ok(Value::Array(list)), Some(ages)) = (&mut clusters, &ages) {
-            for c in list.iter_mut() {
-                let name = c.get("name").and_then(Value::as_str).unwrap_or("").to_string();
-                c["restore_point_age_s"] = json!(ages.get(&name));
-            }
-        }
-        let err = |r: &Result<Value, String>| r.as_ref().err().cloned();
-        let leader = leader.map_err(|e| format!("{e:#}"));
-        let hosts = hosts.map_err(|e| format!("{e:#}"));
-        let errors: Vec<String> = [err(&leader), err(&clusters), err(&hosts)].into_iter().flatten().collect();
-        out.push(json!({
-            "installation": inst.name,
-            "front_door": inst.front_door,
-            "control_plane": leader.as_ref().ok(),
-            "clusters": clusters.as_ref().ok(),
-            "hosts": hosts.as_ref().ok(),
-            "errors": errors,
-        }));
-    }
-    Ok(Json(json!(out)))
+    Ok(Json(json!(crate::fleet::view(&app, q.installation.as_deref()).await?)))
 }
 
 #[derive(Deserialize)]

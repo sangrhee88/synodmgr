@@ -9,6 +9,7 @@ pub mod config;
 pub mod cplane;
 pub mod crypto;
 pub mod db;
+pub mod fleet;
 pub mod lease;
 pub mod passwords;
 pub mod tasks;
@@ -33,6 +34,8 @@ pub struct AppState {
     pub instance: String,
     /// Whether this machine holds the background lease (it copies events and removes old sessions).
     pub leader: AtomicBool,
+    /// What every installation's control plane said last (refreshed in the background).
+    pub fleet: fleet::Fleet,
 }
 
 pub type App = Arc<AppState>;
@@ -58,6 +61,7 @@ impl AppState {
             http,
             instance,
             leader: AtomicBool::new(false),
+            fleet: fleet::Fleet::default(),
         }))
     }
 }
