@@ -5,7 +5,7 @@ Nov 1, 2026 · Sang · Status: proposal; all decisions and open questions confir
 
 ## Summary and decisions
 
-Build **Synod Manager**: one service the customer runs in their own network. It shows every Synod cluster's health and performance, runs admin actions through the control plane, and raises alerts. A web console and a `synodmgr` CLI share one API, as Oracle Enterprise Manager and srvctl do.
+Build **Synod Manager**: one service the customer runs in their own network. It shows every Synod cluster's health and performance, runs admin actions through the control plane, and raises alerts. A web console and a `synodmgr` CLI share one API, as Oracle Enterprise Manager and srvctl do. The bar is to beat every tool on the market at running Synod (see How it beats today's tools).
 
 You confirmed all four decisions below on Nov 1.
 
@@ -30,6 +30,49 @@ Synod Manager does for a Synod RAC fleet what Enterprise Manager, srvctl and DBC
 | GV$SESSION, Performance Hub | Sessions and waits across every writer | `synod.cluster_stat_activity` (writer, wait event, query per session) |
 | Interconnect and gc statistics | Cache Fusion page per writer | `synod.share_stats()`: dozens of counters, such as `blocks_shipped`, `grants_asked_of_other`, `waits_for_other_transactions`, `deadlocks_across_writers` |
 | Incident Manager | Alerts and incidents (milestone 3) | cplane events such as `writer_evicted`, `failover_started`, `heartbeats_missing`; new: rule engine and routing |
+
+## How it beats today's tools
+
+Synod Manager beats the leading tools in two ways. It matches the best of each where they are strong, and it does six things none of them can, because only it knows Synod's writers, block transfers and storage history. Tools checked as of Nov 1, 2026.
+
+| Tool | Best at today | Where it stops for Synod |
+| --- | --- | --- |
+| [Oracle Enterprise Manager 24ai](https://docs.oracle.com/en/enterprise-manager/cloud-control/enterprise-manager-cloud-control/24.1/emcon/new-features-focus-area.html) | Database fleet page, fleet patching from gold images, a natural-language assistant and an MCP server for AI agents, runbooks that run their diagnostic steps, patching itself with no downtime | Oracle databases only |
+| [pganalyze](https://pganalyze.com/webinars/pganalyze-latest-features-for-tuning-postgresql) | Query plans and plan regressions, index advisor, VACUUM advisor | One Postgres server at a time; no clusters, failover or admin actions |
+| [Datadog Database Monitoring](https://docs.datadoghq.com/database_monitoring.md) | Query metrics, samples and explain plans across a fleet; prioritized recommendations | A hosted service, so data leaves the customer's network; nothing about writers or Cache Fusion |
+| [CloudWatch Database Insights](https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/Database-Insights.html) | Fleet health, load by dimension, lock and plan analysis kept 15 months, access control on SQL text | An AWS service; lock and plan analysis need the paid Advanced mode |
+| [Coroot](https://coroot.com/editions) | Service maps from eBPF; [root cause analysis](https://docs.coroot.com/ai/overview) that finds causes with ML, then lets an LLM explain them | Root cause analysis, SSO and RBAC are Enterprise only, at $1 per CPU core per month |
+
+**Matched from the best of each:**
+
+- Fleet health on one page, and load broken down by wait event, user and query (Database Insights, OEM).
+- Per-query statistics across every writer, captured plans and alerts on plan regressions (pganalyze, Datadog). This needs `pg_stat_statements` and `auto_explain` on the writers, still to be checked on shared tables.
+- Index and VACUUM advisors (pganalyze). The VACUUM advisor reads `synod.stats` (undo pages, dead items), since Synod tables keep old versions in an undo log.
+- Lock analysis across writers, including waits on another writer's transactions (Database Insights).
+- An assistant and an MCP server (OEM 24ai). It answers in plain language and shows the metrics it used. It proposes jobs but never runs them, runs on the customer's chosen model or not at all, and goes through the same roles and audit log as people.
+- Runbooks: each alert opens with its first diagnostic steps already run (OEM).
+- 15-month history as an option, and access control on query text (Database Insights).
+- Upgrading the manager without a gap in monitoring (OEM).
+
+**Only Synod Manager:**
+
+| Capability | What it does | Why no other tool can | Milestone |
+| --- | --- | --- | --- |
+| Where the time goes | Per writer, live: time waiting for log servers, page reads, block grants from other writers, other writers' transactions, extension locks | It reads the block service's own timers: `synod.share_stats` already counts calls and microseconds for 16 operations | 1 |
+| Failover explained | Every failover and eviction gets a timeline (detected, voted, fenced, taken over, clients back), each step timed against the cluster's usual times | It joins cplane events (`eviction_voted`, `timeline_fenced`, `writer_evicted`, `failover_done`) with each writer's metrics: the demo's failover replay, as a product | 1 |
+| Cache Fusion advisor | Names the tables whose pages bounce between writers, estimates the gain of giving them to one writer, does it as a previewed job, then shows before and after | Only Synod moves table ownership between running writers (`groups/{grp}/move`) | 2 |
+| Checked after every eviction | Runs `bt_index_check` on every writer after an eviction, as the operations guide asks, and reports the result | It knows when each eviction happened and what to check | 2 |
+| Failover drills | On a schedule, restores the cluster into a scratch copy, kills, freezes and cuts off a writer, checks no commit was lost, and reports the client pauses | Synod already restores a cluster from any restore point; the fault tests already exist | 4 |
+| Time travel | Opens any moment of the last 7 days as a read-only copy, to run queries and compare plans as they were then | Synod keeps every version for its history window, and a restored copy is a branch, not a data copy | 4 |
+
+**The bars it must clear, measured in tests rather than claimed:**
+
+- Install to first page in under 10 minutes on the 7-machine layout.
+- Every page draws in under 1 s and shows data in under 2 s, with 50 clusters of 8 writers.
+- A failover or eviction shows within 10 s, and its explained timeline within 60 s.
+- The exporters cost under 1% of throughput.
+- Stopping the manager never changes a cluster's behaviour: the fault tests run again with the manager killed.
+- Every fault test raises its alert once and clears it.
 
 ## Architecture
 
@@ -76,11 +119,11 @@ Milestone 1 ships seven web console pages, plus the CLI's read commands on the s
 | --- | --- | --- |
 | Fleet | Every cluster and single-writer database: writers up or evicted, control plane leader and standby, open alerts, last restore point | cplane `GET /v1/clusters/{name}`, `/v1/databases`, `/v1/hosts`, `/v1/leader`, restore points |
 | Cluster | Slots and their writers (host, address, state), sharing and table groups, settings, storage layout, restore points, the cluster's event timeline | cplane API; events filtered to the cluster |
-| Writer | Commits per second, connections and pooler use, commit wait for the log servers, block service busy time, CPU, memory and disk | SQL exporter on the writer; `node_exporter` |
+| Writer | Commits per second, connections and pooler use, commit wait for the log servers, block service busy time, CPU, memory and disk; where each writer's time goes, from the block service's timers | SQL exporter on the writer; `node_exporter` |
 | Cache Fusion | Per writer, per second: blocks shipped and received, grants asked of the other writers, waits for other writers' transactions, cross-writer deadlocks, full images logged, slow block service turns | `synod.share_stats()` through the SQL exporter |
 | Sessions and waits | Live list of every writer's sessions, plus a history of wait events sampled every 10 s, like Oracle's ASH | `synod.cluster_stat_activity` |
 | Storage | Log servers (commit lag, flush time), page servers (page read latency, WAL ingest lag, upload backlog to S3), disk space | Page server and log server `/metrics`; `node_exporter` |
-| Events | One timeline of failovers, evictions, moves, setting changes and restore points across every installation | cplane `/v1/events` |
+| Events | One timeline of failovers, evictions, moves, setting changes and restore points across every installation; each failover and eviction explained step by step | cplane `/v1/events` |
 
 By default, the wait-event history keeps counts only (writer, wait event, user, database), not query text. Query text can hold customer data, so storing it is a setting the customer turns on.
 
@@ -133,6 +176,16 @@ Alerts come from two sources: rules over metrics (vmalert, Prometheus rule forma
 
 On-call scheduling stays with the customer's existing tool. Bundling one would add a product to support, and Grafana OnCall OSS, the obvious open-source choice, was archived on March 24, 2026.
 
+## Milestone 4: what no other tool has
+
+Milestone 4 starts once milestones 1 to 3 hold up at the first design partner. By my estimate it is four to six weeks.
+
+- **Failover drills.** Off by default; the customer picks a schedule, such as weekly, and the spare hosts to use. Each drill restores the cluster from a restore point into a scratch cluster, runs the kill, freeze and network-split tests against it, checks the ledger for lost or doubled commits, deletes the scratch cluster, and files a report with the measured client pauses. The report is the proof a CIO asks for, and no other tool gives it.
+- **Time travel.** Pick a moment in the last 7 days; the manager restores it as a read-only copy, points every page and the SQL runner at it, and deletes it after 24 hours unless kept. Plans and table sizes can be compared with today's.
+- **Assistant and MCP server.** Plain-language questions ("why was writer b slow at 3 a.m.?") answered from metrics, events and runbooks, with the evidence linked. It proposes jobs and never runs them. It works with the customer's chosen model or is off, and nothing leaves the network without consent.
+- **Advisors.** Index, VACUUM (undo-aware) and plan-regression advisors over the per-query statistics.
+- **No gaps.** A standby manager, upgrades without a gap in monitoring, and 15-month history as an option.
+
 ## Access, audit log and SSO
 
 People sign in to the manager, never to cplane. The manager is the only holder of each installation's cplane admin token, so its roles and audit log can't be bypassed once that token is rotated.
@@ -176,7 +229,7 @@ The manager installs as one more role in the existing inventory, on a new VM nex
 - **Off the data path.** If the manager stops, clusters keep committing and failing over; only the views and alerts pause. Milestone 1 runs one manager instance; a standby comes later, as cplane got one.
 - **Sizing:** to measure on the 7-machine test layout before quoting a machine size.
 - **AWS, optional.** Whether Synod integrates with AWS (Marketplace image, Secrets Manager) is undecided, so nothing in the manager depends on it. Two rules hold anyway, as Marketplace would require: no data leaves the customer's network without consent (no telemetry), and Synod staff can't reach customer machines unless the customer allows it.
-- **Editions.** A paid edition, with a free Community edition beside it (Marketplace allows a free edition only beside a paid one). Proposed split: Community gets the milestone 1 views and the read-only CLI for one installation; the paid edition adds admin actions, alerts, SSO, audit export and many installations.
+- **Editions.** A paid edition, with a free Community edition beside it (Marketplace allows a free edition only beside a paid one). Proposed split: Community gets the milestone 1 views and the read-only CLI for one installation; the paid edition adds admin actions, alerts, SSO, audit export, many installations and the milestone 4 features.
 - **A Synod-hosted cloud in 2027.** The same binary will serve many customers. Because customer machines take no inbound connections, each customer runs a small outbound-only forwarder for metrics and events. To keep that cheap later, every row in the manager's database and every metric carries an installation id from milestone 1.
 - **Code:** the private repo `sangrhee88/synodmgr`. Manager, console and CLI live there; the Synod-side changes (cplane, agent, extension, installer) stay in `synod-storage` and `stage3-neon-m1`. This design is kept in the repo as `docs/design.md`.
 
@@ -211,6 +264,7 @@ Milestone 1 is about three weeks of work by my estimate; milestones 2 and 3 abou
 6. **Test on AWS** (asks you first; it costs money): one run on the 7-machine layout to measure the exporters' cost to throughput with the warm-cache benchmark, and to size the manager machine. Results collected before teardown; machines terminated and counted to 0.
 7. **Milestone 2**: the job runner and actions, OIDC sign-in, scoped cplane tokens, job ids in events. Each action tested against a live local cluster, including a second job refused while one runs.
 8. **Milestone 3**: the alert pack and Alertmanager. Each fault test must raise its alert exactly once and clear it when the cluster recovers.
+9. **Milestone 4**: failover drills, time travel, the assistant and MCP server, the advisors, a standby manager. Each is checked against the bars in How it beats today's tools before it ships.
 
 ## Risks and questions for you
 
