@@ -29,7 +29,7 @@ async fn main() -> Result<()> {
     let a = Args::parse();
     let cfg = Config::load(&a.config)?;
     let app = AppState::new(cfg.clone())?;
-    db::migrate(&app.db).await?;
+    db::migrate_when_reachable(&app.db, std::time::Duration::from_secs(300)).await?;
     if !synod_manager::users::any_admin(&app.db).await? {
         tracing::warn!("no administrator yet: on this machine, run `synodmgr-admin init-admin` (the installer does)");
     }

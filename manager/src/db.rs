@@ -167,3 +167,23 @@ fn pg_unavailable(e: &tokio_postgres::Error) -> bool {
         }
     }
 }
+
+/// `migrate`, waiting up to `wait` for the repository to be reachable: after a whole installation
+/// restarts, the manager can start before its repository's writer is back.
+pub async fn migrate_when_reachable(db: &Db, wait: std::time::Duration) -> Result<()> {
+    let t0 = std::time::Instant::now();
+    let mut said = false;
+    loop {
+        match migrate(db).await {
+            Ok(()) => return Ok(()),
+            Err(e) if unavailable(&e) && t0.elapsed() < wait => {
+                if !said {
+                    tracing::warn!("the repository is not reachable yet ({e:#}); waiting up to {} s", wait.as_secs());
+                    said = true;
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}

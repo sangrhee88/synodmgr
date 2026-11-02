@@ -382,7 +382,7 @@ function renderEvents(main) {
     const res = await api('GET', `/api/v1/events?${p}`);
     if (res.status !== 200) { body.replaceChildren(h('tr', {}, h('td', { colspan: '5', class: 'error', text: errorText(res) }))); return; }
     body.replaceChildren(...(res.data.length ? res.data.map(e => h('tr', {},
-      h('td', { title: when(e.at), text: ago(since(e.at)) }),
+      h('td', { class: 'nowrap', title: when(e.at), text: ago(since(e.at)) }),
       h('td', { text: e.installation }),
       h('td', { class: 'id', text: e.database || '' }),
       h('td', { text: e.kind.replaceAll('_', ' ') }),
@@ -504,7 +504,7 @@ function renderBackups(main) {
       h('dt', { text: 'Metrics included' }), h('dd', { text: b.metrics ? 'Yes' : 'No' }),
       h('dt', { text: 'Backup key' }), h('dd', {}, b.key_set ? h('span', { class: 'pill ok', text: 'Set' }) : h('span', { class: 'pill bad', text: 'Missing: backups fail' })));
     body.replaceChildren(...(b.backups.length ? b.backups.map(x => h('tr', {},
-      h('td', { title: when(x.at), text: ago(since(x.at)) }), h('td', { text: bytes(x.bytes) }), h('td', { class: 'id', text: x.name })))
+      h('td', { class: 'nowrap', title: when(x.at), text: ago(since(x.at)) }), h('td', { class: 'nowrap', text: bytes(x.bytes) }), h('td', { class: 'id', text: x.name })))
       : [h('tr', {}, h('td', { colspan: '3', class: 'muted', text: 'No backups yet.' }))]));
     now.disabled = !b.dir;
     return b.backups.length;

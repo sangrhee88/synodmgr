@@ -196,8 +196,9 @@ table.list th { text-align: left; font-size: 13px; color: var(--muted); font-wei
 table.list td { padding: 9px 12px; border-bottom: 1px solid var(--rule); vertical-align: top; font-size: 14px; }
 table.list tr:last-child td { border-bottom: 0; }
 table.list td.detail { max-width: 560px; overflow-wrap: anywhere; color: var(--muted); }
-table.list td.actions { white-space: nowrap; }
-table.list td.actions button + button { margin-left: 6px; }
+table.list td.actions { min-width: 120px; }
+table.list td.actions button { margin: 0 6px 6px 0; white-space: nowrap; }
+table.list td.nowrap { white-space: nowrap; }
 .panel.flush { padding: 0; overflow: hidden; }
 .pill { display: inline-block; white-space: nowrap; font-size: 12px; font-weight: 600; border-radius: 999px; padding: 1px 9px; background: var(--bg); color: var(--muted); }
 .pill.ok { background: var(--ok-tint); color: var(--ok); }
@@ -207,7 +208,7 @@ table.list td.actions button + button { margin-left: 6px; }
 .cols { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 14px; align-items: start; }
 /* a wide list with a narrow form beside it; the form goes under the list on smaller screens */
 .cols.list-and-form { grid-template-columns: minmax(0, 1fr) 340px; }
-@media (max-width: 1100px) { .cols.list-and-form { grid-template-columns: minmax(0, 1fr); } }
+@media (max-width: 1240px) { .cols.list-and-form { grid-template-columns: minmax(0, 1fr); } }
 dl.facts { display: grid; grid-template-columns: max-content 1fr; gap: 6px 18px; margin: 12px 0 0; font-size: 14px; }
 dl.facts dt { color: var(--muted); }
 dl.facts dd { margin: 0; overflow-wrap: anywhere; }

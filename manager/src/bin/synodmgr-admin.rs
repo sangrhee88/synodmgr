@@ -122,7 +122,7 @@ async fn main() -> Result<()> {
             let dir = backup_dir(&cfg, dir)?;
             backup::key_from_env()?;
             let app = synod_manager::AppState::new(cfg)?;
-            db::migrate(&app.db).await?;
+            db::migrate_when_reachable(&app.db, std::time::Duration::from_secs(60)).await?;
             let Some(m) = synod_manager::tasks::backup_now(&app, &dir, "root").await else {
                 bail!("the backup failed (the reason is above and in the audit log)");
             };
@@ -137,7 +137,7 @@ async fn main() -> Result<()> {
             let m = tokio::task::spawn_blocking(move || backup::restore(&c2, &f2, &key, parts)).await??;
             // the key file and the anchor are the backup's now
             let pool = db::pool(&cfg.database_url, cfg.database_ca.as_deref())?;
-            db::migrate(&pool).await?;
+            db::migrate_when_reachable(&pool, std::time::Duration::from_secs(60)).await?;
             let sb = crypto::SecretBox::load_or_create(&cfg.key_file)?;
             let audit = Audit::new(pool.clone(), sb.audit_key(), Some(cfg.data_dir.join("audit-anchor")));
             let v = audit.verify().await?;
@@ -167,7 +167,7 @@ async fn main() -> Result<()> {
         _ => {}
     }
     let pool = db::pool(&cfg.database_url, cfg.database_ca.as_deref())?;
-    db::migrate(&pool).await?;
+    db::migrate_when_reachable(&pool, std::time::Duration::from_secs(60)).await?;
     let sb = crypto::SecretBox::load_or_create(&cfg.key_file)?;
     let audit = Audit::new(pool.clone(), sb.audit_key(), Some(cfg.data_dir.join("audit-anchor")));
     match a.cmd {
