@@ -1,20 +1,20 @@
 # Synod Manager: design proposal
 
-Nov 1, 2026 · Sang · Status: proposal; open questions answered Nov 1, design not yet approved. The live, commentable version is the Claude Doc
+Nov 1, 2026 · Sang · Status: proposal; all decisions and open questions confirmed Nov 1. No code yet. The live, commentable version is the Claude Doc
 [Synod Manager: design proposal](https://claude.ai/artifact/FcK4GKdvwTjmN7WsXjvFGx); this file is a copy.
 
 ## Summary and decisions
 
 Build **Synod Manager**: one service the customer runs in their own network. It shows every Synod cluster's health and performance, runs admin actions through the control plane, and raises alerts. A web console and a `synodmgr` CLI share one API, as Oracle Enterprise Manager and srvctl do.
 
-You had no preference on the open questions, so this design takes the defaults below. Each can change before any code is written.
+You confirmed all four decisions below on Nov 1.
 
 | Question | Decision | Why |
 | --- | --- | --- |
 | Form | Web console and CLI, both on one API; the console ships in milestone 1 | Confirmed by you on Nov 1. Every action is scriptable, and the console can never do something the CLI can't |
 | Where it runs | A new VM next to the cluster, in the customer's network | Confirmed by you on Nov 1: next to the cluster it can collect every metric. Pilot machines have no inbound internet access, and Oracle RAC shops run OEM themselves. It ships with `synod-install` and runs on any Linux machine with no AWS service needed; the same build becomes a Synod-hosted cloud in 2027 |
-| Who uses it | Admin and Viewer roles plus an audit log from day one; SSO (OIDC) in milestone 2 | Today one shared token can do everything, with no record of who did what |
-| First milestone | Read-only fleet and performance views | Safe to give pilots early: it adds no new way to break a cluster |
+| Who uses it | Admin and Viewer roles plus an audit log from day one; SSO (OIDC) in milestone 2 | Confirmed by you on Nov 1. Today one shared token can do everything, with no record of who did what |
+| First milestone | Read-only fleet and performance views | Confirmed by you on Nov 1. Safe to give pilots early: it adds no new way to break a cluster |
 
 ## What it is, in Oracle terms
 
