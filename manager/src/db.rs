@@ -124,3 +124,37 @@ pub async fn migrate(db: &Db) -> Result<()> {
     r.context("applying the schema")?;
     Ok(())
 }
+
+/// The error means the repository can't be reached right now (no connection, the connection
+/// dropped, or the server is shutting down or starting): a writer failover, not a fault here.
+pub fn unavailable(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| {
+        if let Some(p) = c.downcast_ref::<deadpool_postgres::PoolError>() {
+            return match p {
+                deadpool_postgres::PoolError::Backend(e) => pg_unavailable(e),
+                deadpool_postgres::PoolError::Timeout(_) | deadpool_postgres::PoolError::Closed => true,
+                _ => false,
+            };
+        }
+        c.downcast_ref::<tokio_postgres::Error>().is_some_and(pg_unavailable)
+    })
+}
+
+fn pg_unavailable(e: &tokio_postgres::Error) -> bool {
+    if e.is_closed() {
+        return true;
+    }
+    match e.code() {
+        // connection exceptions (08...), and admin/crash shutdown or "cannot connect now" (57P01-03)
+        Some(c) => c.code().starts_with("08") || matches!(c.code(), "57P01" | "57P02" | "57P03"),
+        // no SQLSTATE: unreachable only if connecting or talking to the server failed (not, say,
+        // a column that didn't convert, which is a fault here)
+        None => {
+            let s = e.to_string();
+            ["error connecting to server", "error communicating with the server", "error performing TLS handshake", "timeout"]
+                .iter()
+                .any(|p| s.starts_with(p))
+                || std::error::Error::source(e).is_some_and(|x| x.is::<std::io::Error>())
+        }
+    }
+}

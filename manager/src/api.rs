@@ -29,14 +29,26 @@ use crate::users::{self, Role};
 #[derive(Debug)]
 pub struct ApiError(pub StatusCode, pub String);
 
+pub const REPOSITORY_UNAVAILABLE: &str =
+    "The manager's repository is not reachable right now (its writer may be moving to another host); try again in a moment.";
+
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        (self.0, Json(json!({ "error": self.1 }))).into_response()
+        let mut r = (self.0, Json(json!({ "error": self.1 }))).into_response();
+        if self.0 == StatusCode::SERVICE_UNAVAILABLE {
+            r.headers_mut().insert(header::RETRY_AFTER, HeaderValue::from_static("2"));
+        }
+        r
     }
 }
 
 impl From<anyhow::Error> for ApiError {
     fn from(e: anyhow::Error) -> Self {
+        if crate::db::unavailable(&e) {
+            // a failover of the repository's writer: the pool connects to the new one by itself
+            tracing::warn!("repository not reachable: {e:#}");
+            return ApiError(StatusCode::SERVICE_UNAVAILABLE, REPOSITORY_UNAVAILABLE.into());
+        }
         tracing::error!("{e:#}");
         ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Internal error; see the manager's log.".into())
     }

@@ -327,3 +327,30 @@ async fn races_and_tampering() {
     assert_eq!(v["intact"], false, "{v}");
     assert!(v["missing_from"].is_i64(), "{v}");
 }
+
+/// What counts as the repository being unreachable (503, retry) rather than a fault (500).
+#[tokio::test]
+async fn repository_unreachable_vs_fault() {
+    // nothing listens on port 1
+    let pool = db::pool("host=127.0.0.1 port=1 user=x dbname=x connect_timeout=2", None).unwrap();
+    let e = anyhow::Error::from(pool.get().await.err().expect("no server"));
+    assert!(db::unavailable(&e), "refused: {e:#}");
+    let Ok(base_url) = std::env::var("SYNODMGR_TEST_DATABASE_URL") else {
+        eprintln!("SYNODMGR_TEST_DATABASE_URL is not set: skipping the rest");
+        return;
+    };
+    let pool = db::pool(&format!("{base_url} dbname=postgres"), None).unwrap();
+    let c = pool.get().await.unwrap();
+    // a column that doesn't convert, and an ordinary SQL error: faults here, not failovers
+    let e = c.query_one("SELECT 1::int4", &[]).await.unwrap().try_get::<_, String>(0).err().unwrap();
+    assert!(!db::unavailable(&anyhow::Error::from(e)));
+    let e = c.batch_execute("SELECT * FROM no_such_table").await.err().unwrap();
+    assert!(!db::unavailable(&anyhow::Error::from(e)));
+    // the server ending the session (as on a shutdown or failover)
+    let pid: i32 = c.query_one("SELECT pg_backend_pid()", &[]).await.unwrap().get(0);
+    let c2 = pool.get().await.unwrap();
+    c2.execute("SELECT pg_terminate_backend($1)", &[&pid]).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let e = c.batch_execute("SELECT 1").await.err().expect("terminated");
+    assert!(db::unavailable(&anyhow::Error::from(e)), "terminated");
+}

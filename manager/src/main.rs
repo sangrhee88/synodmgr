@@ -22,6 +22,8 @@ async fn main() -> Result<()> {
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
+        // colors only on a terminal: the service's log is a file
+        .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stdout()))
         .init();
     let _ = rustls::crypto::ring::default_provider().install_default();
     let a = Args::parse();
