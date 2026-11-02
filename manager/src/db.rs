@@ -1,14 +1,35 @@
 //! The manager's own state database: a pool and the schema (applied at every start, idempotent).
 
-use anyhow::{Context, Result};
+use std::path::Path;
+
+use anyhow::{Context, Result, bail};
 use deadpool_postgres::{Manager, ManagerConfig, Pool, RecyclingMethod};
 use tokio_postgres::NoTls;
 
 pub type Db = Pool;
 
-pub fn pool(url: &str) -> Result<Db> {
-    let cfg: tokio_postgres::Config = url.parse().context("database_url")?;
-    let mgr = Manager::from_config(cfg, NoTls, ManagerConfig { recycling_method: RecyclingMethod::Fast });
+/// The repository's pool. With `ca`, every connection is TLS, the server's certificate checked
+/// against that CA and the host it was reached at (the writer's own certificate, from the
+/// cluster CA); a writer that fails over is reached again on the pool's next connection.
+pub fn pool(url: &str, ca: Option<&Path>) -> Result<Db> {
+    let mut cfg: tokio_postgres::Config = url.parse().context("database_url")?;
+    let rc = ManagerConfig { recycling_method: RecyclingMethod::Fast };
+    let mgr = match ca {
+        None => Manager::from_config(cfg, NoTls, rc),
+        Some(ca) => {
+            let mut roots = rustls::RootCertStore::empty();
+            let pem = std::fs::read(ca).with_context(|| format!("reading {}", ca.display()))?;
+            for c in rustls_pemfile::certs(&mut pem.as_slice()) {
+                roots.add(c?)?;
+            }
+            if roots.is_empty() {
+                bail!("{}: no certificate", ca.display());
+            }
+            let tls = rustls::ClientConfig::builder().with_root_certificates(roots).with_no_client_auth();
+            cfg.ssl_mode(tokio_postgres::config::SslMode::Require);
+            Manager::from_config(cfg, tokio_postgres_rustls::MakeRustlsConnect::new(tls), rc)
+        }
+    };
     Ok(Pool::builder(mgr).max_size(16).build()?)
 }
 

@@ -32,7 +32,7 @@ pub type App = Arc<AppState>;
 
 impl AppState {
     pub fn new(cfg: config::Config) -> anyhow::Result<App> {
-        let db = db::pool(&cfg.database_url)?;
+        let db = db::pool(&cfg.database_url, cfg.database_ca.as_deref())?;
         let secrets = crypto::SecretBox::load_or_create(&cfg.key_file)?;
         let http = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(10))

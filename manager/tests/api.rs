@@ -35,6 +35,7 @@ async fn start(tag: &str) -> Option<Env> {
     let cfg = Config {
         listen: "127.0.0.1:0".parse().unwrap(),
         database_url: db_url.clone(),
+        database_ca: None,
         tls_cert: None,
         tls_key: None,
         plain_http_on_loopback: true,

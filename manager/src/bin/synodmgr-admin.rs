@@ -69,7 +69,8 @@ fn root(action: &str, target: &str, result: &str) -> Entry {
 async fn main() -> Result<()> {
     let a = Args::parse();
     let cfg = Config::load(&a.config)?;
-    let pool = db::pool(&cfg.database_url)?;
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let pool = db::pool(&cfg.database_url, cfg.database_ca.as_deref())?;
     db::migrate(&pool).await?;
     let sb = crypto::SecretBox::load_or_create(&cfg.key_file)?;
     let audit = Audit::new(pool.clone(), sb.audit_key(), Some(cfg.data_dir.join("audit-anchor")));

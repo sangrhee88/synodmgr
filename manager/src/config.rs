@@ -11,8 +11,13 @@ use serde::Deserialize;
 pub struct Config {
     /// Where the API and console listen, e.g. "0.0.0.0:8443".
     pub listen: SocketAddr,
-    /// The manager's own state database (key=value or URL form).
+    /// The manager's repository (key=value or URL form): a one-writer Synod database, which the
+    /// installer creates in the installation and names here.
     pub database_url: String,
+    /// The cluster CA (PEM): set, the repository is reached over TLS only, its certificate checked
+    /// against this CA and the host name (verify-full).
+    #[serde(default)]
+    pub database_ca: Option<PathBuf>,
     /// TLS certificate chain and key (PEM). The console is served over HTTPS only.
     pub tls_cert: Option<PathBuf>,
     pub tls_key: Option<PathBuf>,
