@@ -12,7 +12,7 @@ You had no preference on the open questions, so this design takes the defaults b
 | Question | Decision | Why |
 | --- | --- | --- |
 | Form | Web console and CLI, both on one API; the console ships in milestone 1 | Confirmed by you on Nov 1. Every action is scriptable, and the console can never do something the CLI can't |
-| Where it runs | A separate service in the customer's network, beside the clusters | Pilot machines have no inbound internet access, and Oracle RAC shops run OEM themselves. It ships with `synod-install` and runs on any Linux machine with no AWS service needed; the same build becomes a Synod-hosted cloud in 2027 |
+| Where it runs | A new VM next to the cluster, in the customer's network | Confirmed by you on Nov 1: next to the cluster it can collect every metric. Pilot machines have no inbound internet access, and Oracle RAC shops run OEM themselves. It ships with `synod-install` and runs on any Linux machine with no AWS service needed; the same build becomes a Synod-hosted cloud in 2027 |
 | Who uses it | Admin and Viewer roles plus an audit log from day one; SSO (OIDC) in milestone 2 | Today one shared token can do everything, with no record of who did what |
 | First milestone | Read-only fleet and performance views | Safe to give pilots early: it adds no new way to break a cluster |
 
@@ -169,7 +169,7 @@ By the standing rule, the agent change is the only one that touches a running wr
 
 ## Packaging and deployment
 
-The manager installs as one more role in the existing inventory, on its own machine, so a cluster in trouble can't take its monitoring down with it.
+The manager installs as one more role in the existing inventory, on a new VM next to the cluster, so a cluster in trouble can't take its monitoring down with it.
 
 - **What runs on the manager machine:** `synod-manager` (API, console and job runner, written in Rust like cplane so it can share its types), a plain PostgreSQL 17 for its own state, VictoriaMetrics for metrics, and in milestone 3 vmalert and Alertmanager. All are managed by systemd units from `synod-install`, like every other service.
 - **One manager, many installations.** Each installation (one cplane pair and its clusters) is added with its front-door URL, admin token and CA certificate. Scrape targets come from the cplane API, so new hosts and writers appear by themselves.
