@@ -12,6 +12,13 @@
 //!                                            from SYNODMGR_ADMIN_TOKEN and SYNODMGR_METRICS_TOKEN
 //!                                            (the installer passes the control plane's)
 //!
+//!   synodmgr-admin backup [--dir DIR]        a backup now (into [backup] dir by default); the
+//!                                            backup key comes from SYNODMGR_BACKUP_KEY
+//!   synodmgr-admin backups [--dir DIR]       the backups there
+//!   synodmgr-admin restore FILE [--only repository,metrics,files]
+//!                                            brings a backup back, with the manager and the
+//!                                            metrics store stopped
+//!
 //! Every change is recorded in the audit log with the actor "root".
 
 use std::path::PathBuf;
@@ -22,7 +29,7 @@ use serde_json::json;
 use synod_manager::audit::{Audit, Entry};
 use synod_manager::config::Config;
 use synod_manager::users::{self, Role};
-use synod_manager::{crypto, db, passwords};
+use synod_manager::{backup, crypto, db, passwords};
 
 #[derive(Parser)]
 #[command(version, about = "Synod Manager administration on the manager machine")]
@@ -46,6 +53,23 @@ enum Cmd {
     ResetPassword { user_id: String },
     /// Check the audit log's hash chain.
     VerifyAudit,
+    /// Make a backup now.
+    Backup {
+        #[arg(long)]
+        dir: Option<PathBuf>,
+    },
+    /// List the backups.
+    Backups {
+        #[arg(long)]
+        dir: Option<PathBuf>,
+    },
+    /// Bring a backup back (stop the manager and the metrics store first).
+    Restore {
+        file: PathBuf,
+        /// Comma-separated: repository, metrics, files (default: all three).
+        #[arg(long)]
+        only: Option<String>,
+    },
     /// Add or update an installation (tokens from SYNODMGR_ADMIN_TOKEN, SYNODMGR_METRICS_TOKEN).
     AddInstallation {
         #[arg(long)]
@@ -61,6 +85,17 @@ enum Cmd {
     },
 }
 
+fn backup_dir(cfg: &Config, dir: &Option<PathBuf>) -> Result<PathBuf> {
+    match dir.clone().or_else(|| cfg.backup.dir.clone()) {
+        Some(d) => Ok(d),
+        None => bail!("no backup directory: pass --dir or set [backup] dir"),
+    }
+}
+
+fn yes(b: bool) -> &'static str {
+    if b { "yes" } else { "no" }
+}
+
 fn root(action: &str, target: &str, result: &str) -> Entry {
     Entry { actor: "root".into(), address: "localhost".into(), action: action.into(), target: target.into(), result: result.into(), ..Default::default() }
 }
@@ -70,6 +105,67 @@ async fn main() -> Result<()> {
     let a = Args::parse();
     let cfg = Config::load(&a.config)?;
     let _ = rustls::crypto::ring::default_provider().install_default();
+    match &a.cmd {
+        Cmd::Backups { dir } => {
+            let dir = backup_dir(&cfg, dir)?;
+            let mut all = backup::list(&dir)?;
+            all.sort_by_key(|(_, t, _)| *t);
+            for (p, t, n) in &all {
+                println!("{}  {:>10.1} MB  {}", t.format("%Y-%m-%d %H:%M:%S UTC"), *n as f64 / 1e6, p.display());
+            }
+            if all.is_empty() {
+                println!("no backups in {}", dir.display());
+            }
+            return Ok(());
+        }
+        Cmd::Backup { dir } => {
+            let dir = backup_dir(&cfg, dir)?;
+            backup::key_from_env()?;
+            let app = synod_manager::AppState::new(cfg)?;
+            db::migrate(&app.db).await?;
+            let Some(m) = synod_manager::tasks::backup_now(&app, &dir, "root").await else {
+                bail!("the backup failed (the reason is above and in the audit log)");
+            };
+            println!("{}", serde_json::to_string(&m)?);
+            return Ok(());
+        }
+        Cmd::Restore { file, only } => {
+            let key = backup::key_from_env()?;
+            let pick = |p: &str| only.as_deref().is_none_or(|o| o.split(',').any(|x| x.trim() == p));
+            let parts = backup::Parts { repository: pick("repository"), metrics: pick("metrics"), files: pick("files") };
+            let (c2, f2) = (cfg.clone(), file.clone());
+            let m = tokio::task::spawn_blocking(move || backup::restore(&c2, &f2, &key, parts)).await??;
+            // the key file and the anchor are the backup's now
+            let pool = db::pool(&cfg.database_url, cfg.database_ca.as_deref())?;
+            db::migrate(&pool).await?;
+            let sb = crypto::SecretBox::load_or_create(&cfg.key_file)?;
+            let audit = Audit::new(pool.clone(), sb.audit_key(), Some(cfg.data_dir.join("audit-anchor")));
+            let v = audit.verify().await?;
+            audit
+                .append(Entry {
+                    request: json!({ "backup_made": m.created_at, "on": m.host, "repository": parts.repository && m.repository,
+                                     "metrics": parts.metrics && m.metrics, "files": parts.files,
+                                     "audit_intact_before": v.intact }),
+                    ..root("restore", &file.display().to_string(), "ok")
+                })
+                .await?;
+            println!(
+                "restored the backup made {} on {}: repository {}, metrics {}, key file and audit anchor {}; audit log {} ({} rows)",
+                m.created_at.format("%Y-%m-%d %H:%M:%S UTC"),
+                m.host,
+                yes(parts.repository && m.repository),
+                yes(parts.metrics && m.metrics),
+                yes(parts.files),
+                if v.intact { "intact" } else { "NOT intact" },
+                v.rows
+            );
+            if !v.intact {
+                bail!("the audit log of the restored repository doesn't verify: {v:?}");
+            }
+            return Ok(());
+        }
+        _ => {}
+    }
     let pool = db::pool(&cfg.database_url, cfg.database_ca.as_deref())?;
     db::migrate(&pool).await?;
     let sb = crypto::SecretBox::load_or_create(&cfg.key_file)?;
@@ -130,6 +226,7 @@ async fn main() -> Result<()> {
                 "ca_cert": !ca.is_empty(), "targets": extra.as_array().map(|a| a.len()) }), ..root(action, &name, "ok") }).await?;
             println!("installation {name}: {} ({front_door})", if existed { "updated" } else { "added" });
         }
+        Cmd::Backup { .. } | Cmd::Backups { .. } | Cmd::Restore { .. } => unreachable!("handled above"),
         Cmd::VerifyAudit => {
             let v = audit.verify().await?;
             match (v.intact, v.first_bad_row, v.missing_from) {

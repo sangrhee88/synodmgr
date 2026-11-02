@@ -35,6 +35,44 @@ pub struct Config {
     pub sessions: SessionConfig,
     #[serde(default)]
     pub passwords: PasswordConfig,
+    #[serde(default)]
+    pub backup: BackupConfig,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+#[serde(deny_unknown_fields, default)]
+pub struct BackupConfig {
+    /// Where the nightly backups go (unset: none). Better on other storage than this machine's
+    /// own disk (a mounted share), so they outlive it.
+    pub dir: Option<PathBuf>,
+    /// Backups older than this are removed (the newest always stays).
+    pub keep_days: i64,
+    /// When, in this machine's local time ("HH:MM").
+    pub at: String,
+    /// Where pg_dump and pg_restore are (unset: on PATH).
+    pub pg_bin: Option<PathBuf>,
+    /// Where vmbackup and vmrestore are (unset: on PATH).
+    pub vm_bin: Option<PathBuf>,
+    /// The metrics store's -storageDataPath (unset: metrics aren't backed up).
+    pub metrics_data: Option<PathBuf>,
+}
+
+impl Default for BackupConfig {
+    fn default() -> Self {
+        Self { dir: None, keep_days: 7, at: "02:30".into(), pg_bin: None, vm_bin: None, metrics_data: None }
+    }
+}
+
+impl BackupConfig {
+    /// `at` as (hour, minute).
+    pub fn time_of_day(&self) -> Result<(u32, u32)> {
+        let (h, m) = self.at.split_once(':').context("backup.at: HH:MM")?;
+        let (h, m): (u32, u32) = (h.parse().context("backup.at: HH:MM")?, m.parse().context("backup.at: HH:MM")?);
+        if h > 23 || m > 59 {
+            bail!("backup.at: HH:MM");
+        }
+        Ok((h, m))
+    }
 }
 
 fn default_metrics_url() -> String {
@@ -97,6 +135,10 @@ impl Config {
         }
         if self.sessions.idle_minutes < 1 || self.sessions.max_hours < 1 {
             bail!("sessions: idle_minutes and max_hours at least 1");
+        }
+        self.backup.time_of_day()?;
+        if self.backup.keep_days < 1 {
+            bail!("backup.keep_days: at least 1");
         }
         Ok(())
     }

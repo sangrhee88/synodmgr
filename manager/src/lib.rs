@@ -4,6 +4,7 @@
 pub mod api;
 pub mod audit;
 pub mod auth;
+pub mod backup;
 pub mod config;
 pub mod cplane;
 pub mod crypto;

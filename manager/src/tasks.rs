@@ -1,6 +1,7 @@
 //! Background work: copying every installation's control plane events (every 5 s), and keeping the
 //! metrics store's scrape configuration in step with the installations and their hosts (every
-//! 60 s). Sessions past their end are removed too.
+//! 60 s). Sessions past their end are removed too, and a backup is made every night when
+//! `[backup] dir` is set.
 
 use std::time::Duration;
 
@@ -14,6 +15,10 @@ use crate::cplane::{self, Installation};
 use crate::crypto::write_private;
 
 pub fn spawn_all(app: App) {
+    if let Some(dir) = app.cfg.backup.dir.clone() {
+        let a = app.clone();
+        tokio::spawn(async move { nightly_backups(a, dir).await });
+    }
     let a = app.clone();
     tokio::spawn(async move {
         let mut t = tokio::time::interval(Duration::from_secs(5));
@@ -197,6 +202,17 @@ async fn prune_sessions(app: &App) -> Result<()> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn next_backup_time() {
+        use chrono::TimeZone;
+        let now = chrono::Local.with_ymd_and_hms(2026, 11, 2, 1, 0, 0).earliest().unwrap();
+        let t = next_at(now, 2, 30);
+        assert_eq!((t.date_naive(), t.format("%H:%M").to_string()), (now.date_naive(), "02:30".into()));
+        let now = chrono::Local.with_ymd_and_hms(2026, 11, 2, 3, 0, 0).earliest().unwrap();
+        let t = next_at(now, 2, 30);
+        assert_eq!(t.date_naive(), now.date_naive().succ_opt().unwrap());
+    }
+
     fn inst(name: &str, token: bool, extra: Value) -> Installation {
         Installation {
             id: 1,
@@ -242,4 +258,72 @@ mod tests {
         assert_eq!(serde_json::from_str::<Value>(&cfg).unwrap()["scrape_configs"].as_array().unwrap().len(), 0);
         assert_eq!(host_port("http://10.0.0.8:3300/x"), Some("10.0.0.8:3300".into()));
     }
+}
+
+/// The next time the clock in this machine's zone shows `h:m`.
+pub fn next_at(now: DateTime<chrono::Local>, h: u32, m: u32) -> DateTime<chrono::Local> {
+    use chrono::TimeZone;
+    let mut day = now.date_naive();
+    loop {
+        let t = day.and_hms_opt(h, m, 0).expect("valid time");
+        // a time skipped by a clock change: the next day's
+        if let Some(t) = chrono::Local.from_local_datetime(&t).earliest() {
+            if t > now {
+                return t;
+            }
+        }
+        day = day.succ_opt().expect("a next day");
+    }
+}
+
+async fn nightly_backups(app: App, dir: std::path::PathBuf) {
+    let (h, m) = app.cfg.backup.time_of_day().unwrap_or((2, 30));
+    loop {
+        let now = chrono::Local::now();
+        let at = next_at(now, h, m);
+        tracing::info!("next backup at {at} in {}", dir.display());
+        tokio::time::sleep((at - now).to_std().unwrap_or(Duration::from_secs(60))).await;
+        backup_now(&app, &dir, "system").await;
+    }
+}
+
+/// Makes a backup and removes the old ones; recorded in the audit log either way.
+pub async fn backup_now(app: &App, dir: &std::path::Path, actor: &str) -> Option<crate::backup::Made> {
+    let cfg = app.cfg.clone();
+    let d = dir.to_path_buf();
+    let keep = cfg.backup.keep_days;
+    let res = tokio::task::spawn_blocking(move || -> Result<(crate::backup::Made, usize)> {
+        let key = crate::backup::key_from_env()?;
+        let made = crate::backup::make(&cfg, &d, &key)?;
+        let removed = crate::backup::prune(&d, keep)?;
+        Ok((made, removed.len()))
+    })
+    .await
+    .map_err(anyhow::Error::from)
+    .and_then(|r| r);
+    let (target, result, request, made) = match res {
+        Ok((m, removed)) => {
+            tracing::info!("backup {} ({} MB, {:.1} s); {removed} old ones removed", m.path.display(), m.bytes / 1_000_000, m.seconds);
+            let name = m.path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+            let req = json!({ "bytes": m.bytes, "seconds": (m.seconds * 10.0).round() / 10.0, "metrics": m.metrics, "removed_old": removed });
+            (name, "ok".to_string(), req, Some(m))
+        }
+        Err(e) => {
+            warn!("backup: {e:#}");
+            (dir.display().to_string(), format!("failed: {e:#}"), json!({}), None)
+        }
+    };
+    let entry = crate::audit::Entry {
+        actor: actor.into(),
+        address: "localhost".into(),
+        action: "backup".into(),
+        target,
+        request,
+        result,
+        ..Default::default()
+    };
+    if let Err(e) = app.audit.append(entry).await {
+        warn!("backup: recording it in the audit log: {e:#}");
+    }
+    made
 }

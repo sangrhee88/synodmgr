@@ -6,7 +6,7 @@
 //! `GET /api/v1/metrics/query`, `GET /api/v1/audit`, `GET /api/v1/audit/verify`.
 //! Administrators: `GET/POST /api/v1/users`, `PATCH /api/v1/users/{id}`,
 //! `POST /api/v1/users/{id}/reset-password|unlock|sign-out`, `POST /api/v1/installations`,
-//! `DELETE /api/v1/installations/{name}`.
+//! `DELETE /api/v1/installations/{name}`, `GET/POST /api/v1/backups`.
 
 use std::net::SocketAddr;
 
@@ -91,6 +91,7 @@ pub fn router(app: App) -> Router {
         .route("/api/v1/metrics/query", get(metrics_query))
         .route("/api/v1/audit", get(audit_list))
         .route("/api/v1/audit/verify", get(audit_verify))
+        .route("/api/v1/backups", get(list_backups).post(backup_now))
         .fallback(not_found)
         .layer(axum::middleware::from_fn(security_headers))
         .with_state(app)
@@ -596,4 +597,37 @@ async fn audit_verify(State(app): State<App>, ConnectInfo(addr): ConnectInfo<Soc
     let p = who(&app, &headers, &method, addr).await?;
     p.ready()?;
     Ok(Json(json!(app.audit.verify().await?)))
+}
+
+// ---- backups ----
+
+async fn list_backups(State(app): State<App>, ConnectInfo(addr): ConnectInfo<SocketAddr>, method: Method, headers: HeaderMap) -> ApiResult<Json<Value>> {
+    let p = who(&app, &headers, &method, addr).await?;
+    p.admin()?;
+    let b = &app.cfg.backup;
+    let mut all = match &b.dir {
+        Some(d) => crate::backup::list(d)?,
+        None => vec![],
+    };
+    all.sort_by_key(|(_, t, _)| std::cmp::Reverse(*t));
+    let list: Vec<Value> = all
+        .iter()
+        .map(|(p, t, n)| json!({ "name": p.file_name().map(|x| x.to_string_lossy().to_string()), "at": t, "bytes": n }))
+        .collect();
+    Ok(Json(json!({
+        "dir": b.dir, "keep_days": b.keep_days, "at": b.at, "metrics": b.metrics_data.is_some(),
+        "key_set": crate::backup::key_from_env().is_ok(), "backups": list,
+    })))
+}
+
+async fn backup_now(State(app): State<App>, ConnectInfo(addr): ConnectInfo<SocketAddr>, method: Method, headers: HeaderMap) -> ApiResult<Json<Value>> {
+    let p = who(&app, &headers, &method, addr).await?;
+    p.admin()?;
+    let Some(dir) = app.cfg.backup.dir.clone() else {
+        return Err(bad("No backup directory is set ([backup] dir in the manager's configuration)."));
+    };
+    // it may take minutes (the metrics): it runs on; the list and the audit log show how it went
+    let (a, who) = (app.clone(), p.user.user_id.clone());
+    tokio::spawn(async move { crate::tasks::backup_now(&a, &dir, &who).await });
+    Ok(Json(json!({ "started": true })))
 }

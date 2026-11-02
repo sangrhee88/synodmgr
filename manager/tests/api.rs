@@ -44,6 +44,7 @@ async fn start(tag: &str) -> Option<Env> {
         metrics_url: "http://127.0.0.1:9".into(),
         sessions: SessionConfig::default(),
         passwords: PasswordConfig::default(),
+        backup: Default::default(),
     };
     let app = AppState::new(cfg).unwrap();
     db::migrate(&app.db).await.unwrap();
