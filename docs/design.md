@@ -256,7 +256,7 @@ Deliberately left out:
 
 Milestone 1 is about three weeks of work by my estimate; milestones 2 and 3 about two to three weeks each. Sizes are rough until the first step is done.
 
-1. **cplane read endpoints** (about 2 days): cluster list, events after an id, `/metrics`. Unit tests in `cplane`.
+1. **cplane read endpoints** (about 2 days): cluster list, events after an id, `/metrics`. Unit tests in `cplane`. Done Nov 1 on branch `manager-api` of synod-storage (built on `pooler`, not merged): unit and store tests pass, and 27 of 27 end-to-end checks with a leader and a standby.
 2. **Collectors** (about 3 days): the agent runs a SQL exporter per writer with Neon's and the new Synod collectors; the installer adds `node_exporter`, the `manager` role and the `synod_monitor` role. Then the local correctness suite, since this is the one change on writer machines.
 3. **Manager core** (about 4 days): API, its own database (installations, users, tokens, audit log), VictoriaMetrics with targets taken from cplane.
 4. **Console and CLI** (about 1 to 1.5 weeks): the seven pages, and `synodmgr` read commands (`status`, `clusters`, `events`, `sessions`).
