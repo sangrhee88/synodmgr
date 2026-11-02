@@ -1,13 +1,13 @@
 # Synod Manager: design proposal
 
-Nov 1, 2026 · Sang · Status: proposal; all decisions and open questions confirmed Nov 1. No code yet. The live, commentable version is the Claude Doc
+Nov 1, 2026 · Sang · Status: steps 1 to 3 done (Nov 2); decisions confirmed Nov 1 and Nov 2. The live, commentable version is the Claude Doc
 [Synod Manager: design proposal](https://claude.ai/artifact/FcK4GKdvwTjmN7WsXjvFGx); this file is a copy.
 
 ## Summary and decisions
 
 Build **Synod Manager**: one service the customer runs in their own network. It shows every Synod cluster's health and performance, runs admin actions through the control plane, and raises alerts. A web console and a `synodmgr` CLI share one API, as Oracle Enterprise Manager and srvctl do. The bar is to beat every tool on the market at running Synod (see How it beats today's tools).
 
-You confirmed all four decisions below on Nov 1.
+You confirmed the decisions below on Nov 1 and Nov 2.
 
 | Question | Decision | Why |
 | --- | --- | --- |
@@ -16,6 +16,8 @@ You confirmed all four decisions below on Nov 1.
 | Who uses it | Admin and Viewer roles plus an audit log from day one; SSO (OIDC) in milestone 2 | Confirmed by you on Nov 1. Today one shared token can do everything, with no record of who did what |
 | Sign-in | Every person signs in to the console with their own user ID and password, and can change the password themselves; in milestone 1 | Asked for by you on Nov 1. It needs no outside identity service; SSO (OIDC) comes beside it in milestone 2 |
 | First milestone | Read-only fleet and performance views | Confirmed by you on Nov 1. Safe to give pilots early: it adds no new way to break a cluster |
+| Repository | A one-writer Synod database, synodmgr, in the same installation; more writers later | Your call on Nov 2: the manager's own work then tests Synod's performance and failover every day. A writer failover costs the console about 2 s of "try again" (measured) |
+| Recovery and scale | Two active manager machines and nightly encrypted backups, in milestone 1; built for hundreds of clusters | Your call on Nov 2: losing a manager machine, its disk or its repository must be recoverable. Tested on Nov 2 (see Recovery and scale) |
 
 ## What it is, in Oracle terms
 
@@ -83,8 +85,8 @@ The manager runs on its own machine and reaches clusters three ways: the cplane 
 flowchart TB
   people["People and scripts<br/>web console, synodmgr CLI"]
   alerts["Alert destinations<br/>email, Slack, PagerDuty"]
-  subgraph mgr["Manager machine (new)"]
-    pg["PostgreSQL 17<br/>inventory, users, audit rows"]
+  subgraph mgr["Manager machines (new): one or two, both active"]
+    bk["Backups<br/>nightly, encrypted, 7 days kept"]
     sm["synod-manager<br/>API, console, jobs, audit log"]
     vm["VictoriaMetrics<br/>metrics history, 30 days"]
     am["Alertmanager and vmalert (M3)<br/>rules, routing"]
@@ -97,12 +99,12 @@ flowchart TB
   end
   apps["Applications"]
   people -->|one API| sm
-  sm --> pg
+  sm --> bk
   sm --> vm
   vm --> am
   am -->|notifications| alerts
   sm -->|"API: reads, jobs"| cp
-  sm -->|"SQL: sessions, cancel"| wr
+  sm -->|"SQL: repository, sessions"| wr
   vm -.->|scrapes every 15 s| cp
   vm -.-> wr
   vm -.-> st
@@ -110,7 +112,7 @@ flowchart TB
   apps -->|"SQL, as today"| wr
 ```
 
-Nothing the manager does sits on the commit or page path, so losing the manager machine pauses only the views and alerts.
+Nothing the manager does sits on the commit or page path, so losing the manager pauses only the views and alerts, never the clusters. Its repository (users, installations and their sealed tokens, events, the audit log) is a one-writer Synod database in the installation, reached over TLS checked against the cluster's own CA, so the manager's daily work also exercises Synod. There can be two manager machines, both serving the console and API (see Recovery and scale).
 
 ## Milestone 1: read-only fleet and performance views
 
@@ -185,7 +187,7 @@ Milestone 4 starts once milestones 1 to 3 hold up at the first design partner. B
 - **Time travel.** Pick a moment in the last 7 days; the manager restores it as a read-only copy, points every page and the SQL runner at it, and deletes it after 24 hours unless kept. Plans and table sizes can be compared with today's.
 - **Assistant and MCP server.** Plain-language questions ("why was writer b slow at 3 a.m.?") answered from metrics, events and runbooks, with the evidence linked. It proposes jobs and never runs them. It works with the customer's chosen model or is off, and nothing leaves the network without consent.
 - **Advisors.** Index, VACUUM (undo-aware) and plan-regression advisors over the per-query statistics.
-- **No gaps.** A standby manager, upgrades without a gap in monitoring, and 15-month history as an option.
+- **No gaps.** Two active manager machines (now in milestone 1), upgrades without a gap in monitoring, and 15-month history as an option.
 
 ## Access, sign-in, audit log and SSO
 
@@ -218,7 +220,6 @@ Thirteen small changes, none on the commit or page path. Each is read-only or a 
 | cplane | `GET /v1/clusters` (list); today only one cluster can be read by name | 1 |
 | cplane | `GET /v1/events?after=<id>&database=<name>`; today it only returns the newest N | 1 |
 | cplane | `GET /metrics`: leader and standby, each host's heartbeat age, writers by state, events counted by kind | 1 |
-| cplane | Report its version and API level (in `/v1/leader` or a new `/v1/version`), so the manager knows which actions a cluster supports | 1 |
 | agent | Serve every writer's metrics on the agent's own /metrics: read-only queries over each compute's local socket at scrape time; the start request carries the cluster's database name | 1 |
 | installer | `node_exporter` on every machine; a `manager` role in the inventory; open the exporter ports to the manager machine | 1 |
 | extension | A `synod_monitor` role created at install with `pg_monitor` (for other users' query text) | 1 |
@@ -228,6 +229,7 @@ Thirteen small changes, none on the commit or page path. Each is read-only or a 
 | cplane | Scoped tokens: read-only and admin | 2 |
 | cplane | Token rotation without restarting cplane | 2 |
 | extension | Per-table counters of blocks moved between writers | 2 |
+| cplane | Report its version and API level (in /v1/leader or a new /v1/version), so the manager knows which actions a cluster supports | 1 |
 
 The agent reuses the SQL already in the fork, in `compute/etc/sql_exporter/` (local file cache, page-read waits, backpressure, LSNs). Synod's own queries sit beside it: `share_stats` counters and timers, `pg_stat_database` totals, and active sessions by wait event from each writer's own `pg_stat_activity`, so no scrape asks another writer anything. A separate read-only metrics token guards `/metrics` on agents and control planes. No third-party exporter runs next to the writers: the agent already has a connection path to each one, and one less binary means one less thing to ship and to vet.
 
@@ -237,14 +239,30 @@ By the standing rule, the agent change is the only one that touches a running wr
 
 The manager installs as one more role in the existing inventory, on a new VM next to the cluster, so a cluster in trouble can't take its monitoring down with it.
 
-- **What runs on the manager machine:** `synod-manager` (API, console and job runner, written in Rust like cplane so it can share its types), a plain PostgreSQL 17 for its own state, VictoriaMetrics for metrics, and in milestone 3 vmalert and Alertmanager. All are managed by systemd units from `synod-install`, like every other service.
+- **What runs on the manager machine:** `synod-manager` (API, console and job runner, written in Rust like cplane so it can share its types), VictoriaMetrics for metrics, and in milestone 3 vmalert and Alertmanager, all managed by systemd units from `synod-install` like every other service. The manager's repository is not on this machine: it is a one-writer Synod database, `synodmgr`, that the installer creates in the installation.
 - **One manager, many installations.** Each installation (one cplane pair and its clusters) is added with its front-door URL, admin token and CA certificate. Scrape targets come from the cplane API, so new hosts and writers appear by themselves.
-- **Off the data path.** If the manager stops, clusters keep committing and failing over; only the views and alerts pause. Milestone 1 runs one manager instance; a standby comes later, as cplane got one.
-- **Sizing:** to measure on the 7-machine test layout before quoting a machine size.
+- **Off the data path, on one or two machines.** If the manager stops, clusters keep committing and failing over; only the views and alerts pause. One or two manager machines, both active: moved into milestone 1 on Nov 2 at your ask (see Recovery and scale).
+- **Sizing:** the load test on Nov 2 shows the manager itself is small (about 100 MB and under 10% of a CPU at 300 installations); the metrics store sets the machine size. To confirm on AWS before quoting a size (see Recovery and scale).
 - **AWS, optional.** Whether Synod integrates with AWS (Marketplace image, Secrets Manager) is undecided, so nothing in the manager depends on it. Two rules hold anyway, as Marketplace would require: no data leaves the customer's network without consent (no telemetry), and Synod staff can't reach customer machines unless the customer allows it.
 - **Editions.** A paid edition, with a free Community edition beside it (Marketplace allows a free edition only beside a paid one). Proposed split: Community gets the milestone 1 views and the read-only CLI for one installation; the paid edition adds admin actions, alerts, SSO, audit export, many installations and the milestone 4 features.
 - **A Synod-hosted cloud in 2027.** The same binary will serve many customers. Because customer machines take no inbound connections, each customer runs a small outbound-only forwarder for metrics and events. To keep that cheap later, every row in the manager's database and every metric carries an installation id from milestone 1.
 - **Code:** the private repo `sangrhee88/synodmgr`. Manager, console and CLI live there; the Synod-side changes (cplane, agent, extension, installer) stay in `synod-storage` and `stage3-neon-m1`. This design is kept in the repo as `docs/design.md`.
+
+## Recovery and scale
+
+Added on Nov 2 at your ask: a manager watching hundreds of clusters must survive losing a machine, its disk or its repository. All of it is in milestone 1 and was tested on the local cluster on Nov 2.
+
+| What fails | What happens | Measured on Nov 2 (local) |
+| --- | --- | --- |
+| A manager machine (node or disk) | The other machine keeps serving the console and API with the same sessions. It already holds every metric, since each machine scrapes everything into its own store. It takes over the background work (copying events) when the lease runs out | Every request answered; takeover in 13 to 14 s (15 s lease); new events copied 3 to 4 s later; a clean stop hands over in under 4 s |
+| The repository's writer | Synod moves the writer as for any database; the manager reconnects by itself and answers "try again" (503) meanwhile | Answers again in 1.9 to 2.3 s, never an error |
+| Both machines, or the repository's contents | Reinstall, then `synod-install … manager-restore FILE` from a nightly backup | 13 s; the same sign-in, users, installations, audit log (verified), events and metrics history |
+| The whole installation the repository lives in | The same restore into a new installation's `synodmgr` database | Not run separately; the same steps as above |
+
+- **Backups.** Every night each manager machine writes one file: the repository (pg\_dump), its metrics (a VictoriaMetrics snapshot), and the manager's key file and audit anchor. It is encrypted with AES-256-GCM using a backup key kept with the installer's secrets; 7 days are kept. Admins can also start one from the console, or with `synod-install … manager-backup --fetch DIR`. Put the backup directory on other storage or fetch copies off the machine, and keep the secrets file elsewhere: a backup can't be read without it.
+- **Two machines.** Both serve the console and API on the shared repository. Work that writes to it (copying events, removing old sessions) is done by whichever machine holds a lease in the repository: 15 s, renewed every 5 s, given up on a clean stop. Both use one key file, of which the installer keeps a copy. Put a DNS name or load balancer in front of both; `[manager] console_names` adds that name to their certificates.
+- **Hundreds of clusters.** The console reads a copy of every control plane's answers, which each machine refreshes every 10 s, 16 at a time, 8 s each. Control planes that stop answering are retried every 30 s in a lane of their own, so they slow no one else. Events are copied 16 installations at a time. Load test with a simulated fleet of 300 installations, 900 clusters and 900 host agents, two manager machines, on a 2-vCPU machine shared with a whole Synod cluster: adding all 300 took 12 s; the whole fleet page loaded in a median 74 ms (p95 under 0.25 s); the copy was at most 3 s old; event copying kept up; both machines scraped every answering target; the manager used 78 to 119 MB and under 10% of a CPU, each metrics store about 260 MB and 12% of a CPU for 124,000 series.
+- **Metrics volume.** A real three-writer installation is about 8,600 series, mostly page server histograms. The console uses only the read-latency one, so the others are not collected by default, which brings it to about 4,500. node\_exporter adds series on every machine, not counted yet. My estimate, not measured: 300 real installations would be about 1.4 million series, roughly 3 GB of memory and 1.5 vCPUs per metrics store, so an m7i.xlarge per manager machine rather than an m7i.large. The AWS run measures it.
 
 ## Open-source pieces and licenses
 
@@ -255,7 +273,7 @@ Every piece shipped is under a permissive license, so the manager can be sold in
 | [VictoriaMetrics](https://pkg.go.dev/github.com/VictoriaMetrics/VictoriaMetrics@v1.141.0-cluster) (single node), vmalert | Metrics store and scraping; alert rules | Apache 2.0 |
 | Prometheus Alertmanager, `node_exporter` | Alert routing; host metrics | Apache 2.0 |
 | [Perses](https://github.com/perses/perses) panels (npm packages) | Charts inside the console | Apache 2.0 |
-| PostgreSQL 17 | The manager's own state | PostgreSQL License |
+| PostgreSQL 17 | Synod itself, which also holds the manager's repository | PostgreSQL License |
 
 Deliberately left out:
 
@@ -268,15 +286,15 @@ Deliberately left out:
 
 Milestone 1 is about three weeks of work by my estimate; milestones 2 and 3 about two to three weeks each. Sizes are rough until the first step is done.
 
-1. **cplane read endpoints** (about 2 days): cluster list, events after an id, `/metrics`. Unit tests in `cplane`. Done Nov 1 on branch `manager-api` of synod-storage (built on `pooler`, not merged): unit and store tests pass, and 27 of 27 end-to-end checks with a leader and a standby.
+1. **cplane read endpoints** (about 2 days): cluster list, events after an id, `/metrics`. Unit tests in `cplane`. Done Nov 1 on branch manager-api of synod-storage (built on pooler, not merged): unit and store tests pass, and 27 of 27 end-to-end checks with a leader and a standby.
 2. **Collectors** (about 3 days): the host agent serves every writer's metrics; the installer adds Ubuntu's `node_exporter`, the metrics token and a `targets` command. The `manager` role and the `synod_monitor` role move to step 3, where the manager first needs them. Then the local correctness suite, since this is the one change on writer machines. Done Nov 1 on branch collectors of synod-storage (not merged): with every agent and control plane scraped every 10 s, the fault tests, schema changes, rewrites, storage, backup, logical replication, read replica, TPC-B, pooler and settings tests all passed, and every writer reports its block service counters and timers. One failure: a cluster restored after concurrent CREATE INDEX has broken indexes. It fails the same way with no metrics at all, so it was an existing restore bug. Fixed Nov 2 on branch restore-fix (control plane only): the full RAC suite then passed 18 of 18, restore included.
-3. **Manager core** (about 5 days): API, its own database (installations, users, tokens, audit log), VictoriaMetrics with targets taken from cplane. Sign-in with a user ID and password: the first admin, adding users, changing and resetting passwords, lockout and sessions, each with its audit row. Also the installer's manager role and the synod_monitor role, moved here from step 2.
+3. **Manager core** (about 5 days): API, its repository (installations, users, tokens, audit log), VictoriaMetrics with targets taken from cplane. Sign-in with a user ID and password: the first admin, adding users, changing and resetting passwords, lockout and sessions, each with its audit row. Also the installer's manager role. Done Nov 2 (sangrhee88/synodmgr, and branch manager of stage3-neon-m1), with three additions you asked for: the repository on a one-writer Synod database, nightly encrypted backups, and two active manager machines built for hundreds of clusters (see Recovery and scale). A security review's findings were fixed and tested. The synod\_monitor role moves to step 4, where the Sessions page first needs it.
 4. **Console and CLI** (about 1 to 1.5 weeks): the seven pages, the sign-in page and an account page (change password; Admins also manage users), and `synodmgr` commands (`login`, `passwd`, `status`, `clusters`, `events`, `sessions`).
 5. **Test locally**: a three-writer cluster from `local3-run.sh`, then the existing fault tests (kill, freeze, network split, machine loss), checking that each shows on the Events and Cluster pages within 10 s.
-6. **Test on AWS** (asks you first; it costs money): small machines to save budget (your ask, Nov 1). Every machine an m7i.large (2 vCPUs, 8 GB, $0.1008 an hour on demand in us-east-2), so the 7-machine layout plus the manager machine costs about $0.81 an hour. Not burstable t3 machines: their CPU credits would blur a throughput measurement. One run measures the agent metrics' cost to throughput with the warm-cache benchmark, scraping on and off on the same machines, and sizes the manager machine. You agreed on Nov 1: one run of about 2 hours (about $2) after the console is built, which also records a console demo video: sign-in, the fleet view, a writer killed and its failover explained step by step, Cache Fusion per writer; captions only, so you can narrate it later. Results collected before teardown; machines terminated and counted to 0.
+6. **Test on AWS** (asks you first; it costs money): small machines to save budget (your ask, Nov 1). Every machine an m7i.large (2 vCPUs, 8 GB, $0.1008 an hour on demand in us-east-2), so the 7-machine layout plus the manager machine costs about $0.81 an hour. Not burstable t3 machines: their CPU credits would blur a throughput measurement. One run measures the agent metrics' cost to throughput with the warm-cache benchmark, scraping on and off on the same machines, and sizes the manager machine: the series of a real installation with node\_exporter included, and the metrics store's memory and CPU at that volume (see the estimate under Recovery and scale). You agreed on Nov 1: one run of about 2 hours (about $2) after the console is built, which also records a console demo video: sign-in, the fleet view, a writer killed and its failover explained step by step, Cache Fusion per writer; captions only, so you can narrate it later. Results collected before teardown; machines terminated and counted to 0.
 7. **Milestone 2**: the job runner and actions, OIDC sign-in, a second sign-in step with a code from an authenticator app (TOTP, optional per user or required for everyone), scoped cplane tokens, job ids in events. Each action tested against a live local cluster, including a second job refused while one runs.
 8. **Milestone 3**: the alert pack and Alertmanager. Each fault test must raise its alert exactly once and clear it when the cluster recovers.
-9. **Milestone 4**: failover drills, time travel, the assistant and MCP server, the advisors, a standby manager. Each is checked against the bars in How it beats today's tools before it ships.
+9. **Milestone 4**: failover drills, time travel, the assistant and MCP server, the advisors. Each is checked against the bars in How it beats today's tools before it ships.
 
 ## Risks and questions for you
 
@@ -287,6 +305,7 @@ Other risks:
 - **The manager holds every cluster's admin token.** Whoever controls it controls the fleet. Encryption at rest in milestone 1; scoped tokens in milestone 2.
 - **The cplane API changes between releases.** The manager will read the cplane version and refuse actions against an API it doesn't know, while still showing pages.
 - **Query text is customer data.** It stays off unless the customer turns it on (see Milestone 1).
+- **The repository lives in the installation it watches.** If that installation's storage fails, the manager's repository goes with it, just when it is needed. The nightly backups are the way back, so they belong off the machine; `database_url` can also point at a Synod database in another installation.
 
 Questions before code starts, answered Nov 1:
 
