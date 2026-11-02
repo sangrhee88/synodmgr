@@ -46,10 +46,12 @@ pub struct User {
     pub password_set_at: DateTime<Utc>,
     pub created_at: DateTime<Utc>,
     pub last_sign_in: Option<DateTime<Utc>>,
+    #[serde(skip)]
+    pub password_version: i32,
 }
 
 const COLS: &str = "id, user_id, name, role, password_hash, must_change, disabled, failed_count, locked_until, \
-                    password_set_at, created_at, last_sign_in";
+                    password_set_at, created_at, last_sign_in, password_version";
 
 fn from_row(r: &tokio_postgres::Row) -> User {
     User {
@@ -65,6 +67,7 @@ fn from_row(r: &tokio_postgres::Row) -> User {
         password_set_at: r.get(9),
         created_at: r.get(10),
         last_sign_in: r.get(11),
+        password_version: r.get(12),
     }
 }
 
@@ -105,16 +108,44 @@ pub async fn create(db: &Db, user_id: &str, name: &str, role: Role, hash: &str, 
     Ok(n == 1)
 }
 
-/// A new password: `must_change` for one an admin or root set; the lockout is cleared.
-pub async fn set_password(db: &Db, id: i64, hash: &str, must_change: bool) -> Result<()> {
+/// A new password: `must_change` for one an admin or root set; the lockout is cleared and the
+/// password version goes up (sessions opened with the old one end). Returns the new version.
+pub async fn set_password(db: &Db, id: i64, hash: &str, must_change: bool) -> Result<i32> {
     let c = db.get().await?;
-    c.execute(
+    Ok(c.query_one(
         "UPDATE users SET password_hash = $2, must_change = $3, password_set_at = now(), failed_count = 0,
-                          locked_until = NULL WHERE id = $1",
+                          locked_until = NULL, password_version = password_version + 1
+         WHERE id = $1 RETURNING password_version",
         &[&id, &hash, &must_change],
     )
+    .await?
+    .get(0))
+}
+
+/// `update`, refused (false) when it would leave no enabled administrator: the check and the change
+/// in one transaction that holds every enabled administrator's row, so two administrators
+/// disabling each other at once can't both succeed.
+pub async fn update_guarded(db: &Db, id: i64, name: Option<&str>, role: Option<Role>, disabled: Option<bool>) -> Result<bool> {
+    let mut c = db.get().await?;
+    let tx = c.transaction().await?;
+    let admins: Vec<i64> = tx
+        .query("SELECT id FROM users WHERE role = 'admin' AND NOT disabled ORDER BY id FOR UPDATE", &[])
+        .await?
+        .iter()
+        .map(|r| r.get(0))
+        .collect();
+    let removes = admins.contains(&id) && (role == Some(Role::Viewer) || disabled == Some(true));
+    if removes && admins.iter().all(|&a| a == id) {
+        return Ok(false);
+    }
+    tx.execute(
+        "UPDATE users SET name = COALESCE($2, name), role = COALESCE($3, role), disabled = COALESCE($4, disabled)
+         WHERE id = $1",
+        &[&id, &name, &role.map(|r| r.as_str()), &disabled],
+    )
     .await?;
-    Ok(())
+    tx.commit().await?;
+    Ok(true)
 }
 
 pub async fn update(db: &Db, id: i64, name: Option<&str>, role: Option<Role>, disabled: Option<bool>) -> Result<()> {
@@ -134,24 +165,34 @@ pub async fn unlock(db: &Db, id: i64) -> Result<()> {
     Ok(())
 }
 
-/// A wrong password: one more failure; at `limit` in a row the account waits `minutes`.
-/// Returns true if this failure locked it.
-pub async fn record_failure(db: &Db, id: i64, limit: i32, minutes: i64) -> Result<bool> {
+/// What reserving a password attempt found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Attempt {
+    /// The account is paused (or disabled): no attempt.
+    Refused,
+    /// Counted as a failure until it succeeds; `locks` if it was the last one allowed.
+    Counted { locks: bool },
+}
+
+/// Counts a password attempt before the password is checked, in one statement, so concurrent
+/// attempts can't get past the limit: at `limit` attempts in a row the account waits `minutes`
+/// (the count starts over then). A correct password clears it (`record_success`).
+pub async fn reserve_attempt(db: &Db, id: i64, limit: i32, minutes: i64) -> Result<Attempt> {
     let c = db.get().await?;
     let r = c
-        .query_one(
-            "UPDATE users SET failed_count = failed_count + 1,
+        .query_opt(
+            "UPDATE users SET failed_count = CASE WHEN failed_count + 1 >= $2 THEN 0 ELSE failed_count + 1 END,
                               locked_until = CASE WHEN failed_count + 1 >= $2
-                                                  THEN now() + make_interval(mins => $3::int) ELSE locked_until END
-             WHERE id = $1 RETURNING failed_count >= $2",
+                                                  THEN now() + make_interval(mins => $3::int) ELSE NULL END
+             WHERE id = $1 AND NOT disabled AND (locked_until IS NULL OR locked_until <= now())
+             RETURNING locked_until IS NOT NULL",
             &[&id, &limit, &(minutes as i32)],
         )
         .await?;
-    let locked: bool = r.get(0);
-    if locked {
-        c.execute("UPDATE users SET failed_count = 0 WHERE id = $1", &[&id]).await?;
-    }
-    Ok(locked)
+    Ok(match r {
+        None => Attempt::Refused,
+        Some(row) => Attempt::Counted { locks: row.get(0) },
+    })
 }
 
 pub async fn record_success(db: &Db, id: i64) -> Result<()> {

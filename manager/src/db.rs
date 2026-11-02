@@ -52,8 +52,9 @@ CREATE TABLE IF NOT EXISTS sessions (
 );
 CREATE INDEX IF NOT EXISTS sessions_user ON sessions (user_ref);
 
--- One append-only row per action and sign-in. Each row's hash covers the previous row's hash,
--- so a removed or edited row shows (audit.rs verifies the chain).
+-- One append-only row per action and sign-in. Each row's hash is an HMAC (keyed outside the
+-- database) over the previous row's hash and its own fields, and the newest row is also recorded
+-- on the manager machine, so a removed or edited row shows (audit.rs verifies the chain).
 CREATE TABLE IF NOT EXISTS audit (
     id         bigserial PRIMARY KEY,
     at         timestamptz NOT NULL,
@@ -74,6 +75,11 @@ END $$;
 DROP TRIGGER IF EXISTS audit_append_only ON audit;
 CREATE TRIGGER audit_append_only BEFORE UPDATE OR DELETE OR TRUNCATE ON audit
     FOR EACH STATEMENT EXECUTE FUNCTION audit_append_only();
+
+-- A password change raises the version; a session opened with an older version is no longer valid
+-- (a sign-in under way while the password changed can't leave a session behind).
+ALTER TABLE users ADD COLUMN IF NOT EXISTS password_version integer NOT NULL DEFAULT 1;
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS password_version integer NOT NULL DEFAULT 1;
 
 -- The control planes' events, copied every 5 s (cplane GET /v1/events?after=).
 CREATE TABLE IF NOT EXISTS events (

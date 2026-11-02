@@ -84,7 +84,18 @@ pub fn router(app: App) -> Router {
         .with_state(app)
 }
 
-async fn security_headers(req: axum::extract::Request, next: axum::middleware::Next) -> Response {
+async fn security_headers(mut req: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    // the host this request was sent to, for the CSRF check (HTTP/2 has no Host header); never
+    // what a client says it is
+    let host = req
+        .uri()
+        .authority()
+        .map(|a| a.as_str().to_string())
+        .or_else(|| req.headers().get(header::HOST).and_then(|v| v.to_str().ok()).map(str::to_string));
+    req.headers_mut().remove(auth::HOST_HEADER);
+    if let Some(h) = host.and_then(|h| HeaderValue::from_str(&h).ok()) {
+        req.headers_mut().insert(auth::HOST_HEADER, h);
+    }
     let mut r = next.run(req).await;
     let h = r.headers_mut();
     h.insert("x-content-type-options", HeaderValue::from_static("nosniff"));
@@ -220,10 +231,10 @@ async fn add_user(
     let made = users::create(&app.db, user_id, req.name.trim(), role, &hash, true).await?;
     let request = json!({ "user_id": user_id, "name": req.name.trim(), "role": role.as_str() });
     if !made {
-        audit::append(&app.db, Entry { result: "refused: the user ID is taken".into(), request, ..p.entry("user_add", user_id) }).await?;
+        app.audit.append(Entry { result: "refused: the user ID is taken".into(), request, ..p.entry("user_add", user_id) }).await?;
         return Err(ApiError(StatusCode::CONFLICT, format!("A user {user_id} exists.")));
     }
-    audit::append(&app.db, Entry { result: "ok".into(), request, ..p.entry("user_add", user_id) }).await?;
+    app.audit.append(Entry { result: "ok".into(), request, ..p.entry("user_add", user_id) }).await?;
     Ok(Json(json!({
         "user_id": user_id,
         "role": role.as_str(),
@@ -258,19 +269,15 @@ async fn update_user(
         Some(r) => Some(Role::parse(r).ok_or_else(|| bad("role: \"admin\" or \"viewer\"."))?),
         None => None,
     };
-    let removes_admin = u.role == Role::Admin
-        && !u.disabled
-        && (role == Some(Role::Viewer) || req.disabled == Some(true));
     let request = json!({ "name": req.name, "role": req.role, "disabled": req.disabled });
-    if removes_admin && users::other_active_admins(&app.db, u.id).await? == 0 {
-        audit::append(&app.db, Entry { result: "refused: the last administrator".into(), request, ..p.entry("user_update", &user_id) }).await?;
+    if !users::update_guarded(&app.db, u.id, req.name.as_deref().map(str::trim), role, req.disabled).await? {
+        app.audit.append(Entry { result: "refused: the last administrator".into(), request, ..p.entry("user_update", &user_id) }).await?;
         return Err(bad("This is the last enabled administrator: make another administrator first."));
     }
-    users::update(&app.db, u.id, req.name.as_deref().map(str::trim), role, req.disabled).await?;
     if req.disabled == Some(true) {
         auth::end_sessions(&app, u.id, None).await?;
     }
-    audit::append(&app.db, Entry { result: "ok".into(), request, ..p.entry("user_update", &user_id) }).await?;
+    app.audit.append(Entry { result: "ok".into(), request, ..p.entry("user_update", &user_id) }).await?;
     Ok(Json(json!(users::by_id(&app.db, u.id).await?)))
 }
 
@@ -287,11 +294,9 @@ async fn reset_password(
     let (pw, hash) = temp_password().await?;
     users::set_password(&app.db, u.id, &hash, true).await?;
     let ended = auth::end_sessions(&app, u.id, None).await?;
-    audit::append(
-        &app.db,
-        Entry { result: "ok".into(), request: json!({ "sessions_ended": ended }), ..p.entry("password_reset", &user_id) },
-    )
-    .await?;
+    app.audit
+        .append(Entry { result: "ok".into(), request: json!({ "sessions_ended": ended }), ..p.entry("password_reset", &user_id) })
+        .await?;
     Ok(Json(json!({
         "user_id": user_id,
         "temporary_password": pw,
@@ -310,7 +315,7 @@ async fn unlock_user(
     p.admin()?;
     let u = target_user(&app, &user_id).await?;
     users::unlock(&app.db, u.id).await?;
-    audit::append(&app.db, Entry { result: "ok".into(), ..p.entry("user_unlock", &user_id) }).await?;
+    app.audit.append(Entry { result: "ok".into(), ..p.entry("user_unlock", &user_id) }).await?;
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -325,7 +330,7 @@ async fn sign_out_user(
     p.admin()?;
     let u = target_user(&app, &user_id).await?;
     let n = auth::end_sessions(&app, u.id, None).await?;
-    audit::append(&app.db, Entry { result: "ok".into(), request: json!({ "sessions_ended": n }), ..p.entry("user_sign_out", &user_id) })
+    app.audit.append(Entry { result: "ok".into(), request: json!({ "sessions_ended": n }), ..p.entry("user_sign_out", &user_id) })
         .await?;
     Ok(Json(json!({ "sessions_ended": n })))
 }
@@ -375,7 +380,7 @@ async fn add_installation(
     let version = match cplane::check(&app, &req.front_door, &req.admin_token).await {
         Ok(v) => v,
         Err(e) => {
-            audit::append(&app.db, Entry { result: format!("refused: {e:#}"), request, ..p.entry("installation_add", &req.name) }).await?;
+            app.audit.append(Entry { result: format!("refused: {e:#}"), request, ..p.entry("installation_add", &req.name) }).await?;
             return Err(bad(format!("The control plane didn't answer as expected: {e:#}")));
         }
     };
@@ -395,10 +400,10 @@ async fn add_installation(
         )
         .await?;
     if n == 0 {
-        audit::append(&app.db, Entry { result: "refused: the name is taken".into(), request, ..p.entry("installation_add", &req.name) }).await?;
+        app.audit.append(Entry { result: "refused: the name is taken".into(), request, ..p.entry("installation_add", &req.name) }).await?;
         return Err(ApiError(StatusCode::CONFLICT, format!("An installation {} exists.", req.name)));
     }
-    audit::append(&app.db, Entry { result: "ok".into(), request, ..p.entry("installation_add", &req.name) }).await?;
+    app.audit.append(Entry { result: "ok".into(), request, ..p.entry("installation_add", &req.name) }).await?;
     if let Err(e) = crate::tasks::write_scrape_config(&app).await {
         tracing::warn!("scrape configuration: {e:#}");
     }
@@ -419,7 +424,7 @@ async fn remove_installation(
     if n == 0 {
         return Err(ApiError(StatusCode::NOT_FOUND, format!("No installation {name}.")));
     }
-    audit::append(&app.db, Entry { result: "ok".into(), ..p.entry("installation_remove", &name) }).await?;
+    app.audit.append(Entry { result: "ok".into(), ..p.entry("installation_remove", &name) }).await?;
     let _ = crate::tasks::write_scrape_config(&app).await;
     Ok(Json(json!({ "ok": true })))
 }
@@ -568,7 +573,7 @@ async fn audit_list(
 ) -> ApiResult<Response> {
     let p = who(&app, &headers, &method, addr).await?;
     p.ready()?;
-    let rows = audit::list(&app.db, q.after.unwrap_or(0), q.limit.unwrap_or(1000)).await?;
+    let rows = app.audit.list(q.after.unwrap_or(0), q.limit.unwrap_or(1000)).await?;
     Ok(match q.format.as_deref() {
         Some("csv") => ([(header::CONTENT_TYPE, "text/csv; charset=utf-8")], audit::csv(&rows)).into_response(),
         _ => Json(json!(rows)).into_response(),
@@ -578,6 +583,5 @@ async fn audit_list(
 async fn audit_verify(State(app): State<App>, ConnectInfo(addr): ConnectInfo<SocketAddr>, method: Method, headers: HeaderMap) -> ApiResult<Json<Value>> {
     let p = who(&app, &headers, &method, addr).await?;
     p.ready()?;
-    let (rows, broken) = audit::verify(&app.db).await?;
-    Ok(Json(json!({ "rows": rows, "intact": broken.is_none(), "first_bad_row": broken })))
+    Ok(Json(json!(app.audit.verify().await?)))
 }

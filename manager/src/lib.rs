@@ -20,7 +20,11 @@ pub struct AppState {
     pub cfg: config::Config,
     pub db: db::Db,
     pub secrets: crypto::SecretBox,
+    pub audit: audit::Audit,
     pub throttle: auth::Throttle,
+    /// Password hashes checked at once (Argon2id takes 19 MiB each): a burst of sign-ins waits
+    /// here instead of using up the machine's memory.
+    pub hashing: tokio::sync::Semaphore,
     pub http: reqwest::Client,
 }
 
@@ -34,6 +38,15 @@ impl AppState {
             .timeout(std::time::Duration::from_secs(10))
             .user_agent(concat!("synod-manager/", env!("CARGO_PKG_VERSION")))
             .build()?;
-        Ok(Arc::new(AppState { cfg, db, secrets, throttle: auth::Throttle::default(), http }))
+        let audit = audit::Audit::new(db.clone(), secrets.audit_key(), Some(cfg.data_dir.join("audit-anchor")));
+        Ok(Arc::new(AppState {
+            cfg,
+            db,
+            secrets,
+            audit,
+            throttle: auth::Throttle::default(),
+            hashing: tokio::sync::Semaphore::new(4),
+            http,
+        }))
     }
 }

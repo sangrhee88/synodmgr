@@ -16,15 +16,16 @@ use tokio_postgres::NoTls;
 const ADMIN_PW: &str = "initial one-time pass 77";
 
 struct Env {
+    app: synod_manager::App,
     base: String,
     http: reqwest::Client,
     db_url: String,
     _dir: tempfile::TempDir,
 }
 
-async fn start() -> Option<Env> {
+async fn start(tag: &str) -> Option<Env> {
     let base_url = std::env::var("SYNODMGR_TEST_DATABASE_URL").ok()?;
-    let name = format!("synodmgr_test_{}", std::process::id());
+    let name = format!("synodmgr_test_{}_{tag}", std::process::id());
     let (c, conn) = tokio_postgres::connect(&format!("{base_url} dbname=postgres"), NoTls).await.unwrap();
     tokio::spawn(conn);
     c.batch_execute(&format!("DROP DATABASE IF EXISTS {name} WITH (FORCE)")).await.unwrap();
@@ -50,9 +51,9 @@ async fn start() -> Option<Env> {
         .unwrap();
     let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = l.local_addr().unwrap();
-    let router = api::router(app).into_make_service_with_connect_info::<SocketAddr>();
+    let router = api::router(app.clone()).into_make_service_with_connect_info::<SocketAddr>();
     tokio::spawn(async move { axum::serve(l, router).await.unwrap() });
-    Some(Env { base: format!("http://{addr}"), http: reqwest::Client::new(), db_url, _dir: dir })
+    Some(Env { app, base: format!("http://{addr}"), http: reqwest::Client::new(), db_url, _dir: dir })
 }
 
 impl Env {
@@ -97,7 +98,7 @@ const GOOD2: &str = "violet harbor tundra pickle";
 
 #[tokio::test]
 async fn sign_in_accounts_and_audit() {
-    let Some(e) = start().await else {
+    let Some(e) = start("main").await else {
         eprintln!("SYNODMGR_TEST_DATABASE_URL is not set: skipping");
         return;
     };
@@ -253,4 +254,75 @@ async fn sign_in_accounts_and_audit() {
         last = e.sign_in("nobody", "guessing guessing").await.0;
     }
     assert_eq!(last, StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[tokio::test]
+async fn races_and_tampering() {
+    let Some(e) = start("races").await else {
+        eprintln!("SYNODMGR_TEST_DATABASE_URL is not set: skipping");
+        return;
+    };
+    let t = e.token("admin", ADMIN_PW).await;
+    let (s, _) = e.call("POST", "/api/v1/me/password", &t, Some(json!({"current_password": ADMIN_PW, "new_password": GOOD}))).await;
+    assert_eq!(s, StatusCode::OK);
+    let (_, v) = e.call("POST", "/api/v1/users", &t, Some(json!({"user_id": "dave", "role": "viewer"}))).await;
+    let dave_pw = v["temporary_password"].as_str().unwrap().to_string();
+
+    // --- 40 guesses at once: no more than 10 are checked, then the account is paused ---
+    let mut set = tokio::task::JoinSet::new();
+    for i in 0..40 {
+        let http = e.http.clone();
+        let url = format!("{}/api/v1/sign-in", e.base);
+        set.spawn(async move {
+            http.post(url).json(&json!({"user_id": "dave", "password": format!("guess number {i} for dave"), "client": "cli"}))
+                .send().await.unwrap().status()
+        });
+    }
+    let mut statuses = Vec::new();
+    while let Some(r) = set.join_next().await {
+        statuses.push(r.unwrap());
+    }
+    assert!(statuses.iter().all(|s| *s == StatusCode::UNAUTHORIZED || *s == StatusCode::TOO_MANY_REQUESTS), "{statuses:?}");
+    let checked: i64 = e.sql("SELECT count(*) FROM audit WHERE actor = 'dave' AND result LIKE 'failed: wrong password%'").await[0].get(0);
+    assert!(checked <= 10, "{checked} guesses checked: more than the limit");
+    // 40 failures from this address: it waits too (429); forget it to go on
+    assert_eq!(e.sign_in("dave", &dave_pw).await.0, StatusCode::TOO_MANY_REQUESTS, "this address waits");
+    e.app.throttle.clear();
+    assert_eq!(e.sign_in("dave", &dave_pw).await.0, StatusCode::UNAUTHORIZED, "paused even with the right password");
+    assert_eq!(e.call("POST", "/api/v1/users/dave/unlock", &t, None).await.0, StatusCode::OK);
+
+    // --- a session opened with an older password version is refused ---
+    let td = e.token("dave", &dave_pw).await;
+    assert_eq!(e.call("GET", "/api/v1/me", &td, None).await.0, StatusCode::OK);
+    e.sql("UPDATE users SET password_version = password_version + 1 WHERE user_id = 'dave'").await;
+    assert_eq!(e.call("GET", "/api/v1/me", &td, None).await.0, StatusCode::UNAUTHORIZED, "the password changed after this sign-in began");
+
+    // --- wrong current passwords count toward the lockout, and the pausing one signs out ---
+    let td = e.token("dave", &dave_pw).await;
+    let mut last = Value::Null;
+    for _ in 0..10 {
+        last = e.call("POST", "/api/v1/me/password", &td, Some(json!({"current_password": "not it at all", "new_password": GOOD2}))).await.1;
+    }
+    assert!(last["error"].as_str().unwrap().contains("paused"), "{last}");
+    assert_eq!(e.call("GET", "/api/v1/me", &td, None).await.0, StatusCode::UNAUTHORIZED);
+    assert_eq!(e.call("POST", "/api/v1/users/dave/unlock", &t, None).await.0, StatusCode::OK);
+
+    // --- a password typed as the user ID is not kept in the audit log ---
+    let typed = "Correct Horse Battery Staple 99";
+    assert_eq!(e.sign_in(typed, "x").await.0, StatusCode::UNAUTHORIZED);
+    let leaked: i64 = e.sql(&format!("SELECT count(*) FROM audit WHERE actor LIKE '%{typed}%' OR target LIKE '%{typed}%'")).await[0].get(0);
+    assert_eq!(leaked, 0);
+    let hashed: i64 = e.sql("SELECT count(*) FROM audit WHERE actor LIKE 'unknown:%'").await[0].get(0);
+    assert!(hashed >= 1);
+
+    // --- the audit chain: intact; then the newest rows removed: caught by the anchor ---
+    let (_, v) = e.call("GET", "/api/v1/audit/verify", &t, None).await;
+    assert_eq!(v["intact"], true, "{v}");
+    let (c, conn) = tokio_postgres::connect(&e.db_url, NoTls).await.unwrap();
+    tokio::spawn(conn);
+    c.batch_execute("ALTER TABLE audit DISABLE TRIGGER audit_append_only;
+                     DELETE FROM audit WHERE id > (SELECT max(id) - 2 FROM audit);").await.unwrap();
+    let (_, v) = e.call("GET", "/api/v1/audit/verify", &t, None).await;
+    assert_eq!(v["intact"], false, "{v}");
+    assert!(v["missing_from"].is_i64(), "{v}");
 }

@@ -19,7 +19,7 @@ use std::path::PathBuf;
 use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
 use serde_json::json;
-use synod_manager::audit::{self, Entry};
+use synod_manager::audit::{Audit, Entry};
 use synod_manager::config::Config;
 use synod_manager::users::{self, Role};
 use synod_manager::{crypto, db, passwords};
@@ -71,6 +71,8 @@ async fn main() -> Result<()> {
     let cfg = Config::load(&a.config)?;
     let pool = db::pool(&cfg.database_url)?;
     db::migrate(&pool).await?;
+    let sb = crypto::SecretBox::load_or_create(&cfg.key_file)?;
+    let audit = Audit::new(pool.clone(), sb.audit_key(), Some(cfg.data_dir.join("audit-anchor")));
     match a.cmd {
         Cmd::InitAdmin { out, user_id } => {
             if users::any_admin(&pool).await? {
@@ -83,7 +85,7 @@ async fn main() -> Result<()> {
                 bail!("user {user_id} exists but is not an administrator");
             }
             crypto::write_private(&out, format!("{pw}\n").as_bytes())?;
-            audit::append(&pool, Entry { request: json!({ "password_file": out }), ..root("user_add", &user_id, "ok: first administrator") }).await?;
+            audit.append(Entry { request: json!({ "password_file": out }), ..root("user_add", &user_id, "ok: first administrator") }).await?;
             println!("administrator {user_id}: one-time password in {} (it must be changed at first sign-in)", out.display());
         }
         Cmd::ResetPassword { user_id } => {
@@ -95,7 +97,7 @@ async fn main() -> Result<()> {
             users::update(&pool, u.id, None, None, Some(false)).await?;
             let c = pool.get().await?;
             let ended = c.execute("DELETE FROM sessions WHERE user_ref = $1", &[&u.id]).await?;
-            audit::append(&pool, Entry { request: json!({ "sessions_ended": ended }), ..root("password_reset", &user_id, "ok") }).await?;
+            audit.append(Entry { request: json!({ "sessions_ended": ended }), ..root("password_reset", &user_id, "ok") }).await?;
             println!("{user_id}: one-time password {pw}\n(the account is unlocked and enabled; the password must be changed at the next sign-in)");
         }
         Cmd::AddInstallation { name, front_door, ca_cert, targets } => {
@@ -112,7 +114,6 @@ async fn main() -> Result<()> {
                 Some(p) => serde_json::from_str(&std::fs::read_to_string(p)?)?,
                 None => json!([]),
             };
-            let sb = crypto::SecretBox::load_or_create(&cfg.key_file)?;
             let c = pool.get().await?;
             let existed: bool = c.query_one("SELECT EXISTS (SELECT 1 FROM installations WHERE name = $1)", &[&name]).await?.get(0);
             c.execute(
@@ -124,15 +125,17 @@ async fn main() -> Result<()> {
             )
             .await?;
             let action = if existed { "installation_update" } else { "installation_add" };
-            audit::append(&pool, Entry { request: json!({ "front_door": front_door, "metrics_token": !metrics.is_empty(),
+            audit.append(Entry { request: json!({ "front_door": front_door, "metrics_token": !metrics.is_empty(),
                 "ca_cert": !ca.is_empty(), "targets": extra.as_array().map(|a| a.len()) }), ..root(action, &name, "ok") }).await?;
             println!("installation {name}: {} ({front_door})", if existed { "updated" } else { "added" });
         }
         Cmd::VerifyAudit => {
-            let (rows, broken) = audit::verify(&pool).await?;
-            match broken {
-                None => println!("audit log intact: {rows} rows"),
-                Some(id) => bail!("audit log broken at row {id} (of {rows}): a row was removed or changed"),
+            let v = audit.verify().await?;
+            match (v.intact, v.first_bad_row, v.missing_from) {
+                (true, _, _) => println!("audit log intact: {} rows", v.rows),
+                (_, Some(id), _) => bail!("audit log broken at row {id}: a row was changed or removed"),
+                (_, _, Some(id)) => bail!("audit log broken: rows from {id} on were removed"),
+                _ => bail!("audit log broken"),
             }
         }
     }
