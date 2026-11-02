@@ -74,6 +74,10 @@ fn bad(msg: impl Into<String>) -> ApiError {
 
 pub fn router(app: App) -> Router {
     Router::new()
+        .route("/", get(console_index))
+        .route("/console.js", get(console_js))
+        .route("/console.css", get(console_css))
+        .route("/favicon.svg", get(console_icon))
         .route("/api/v1/health", get(health))
         .route("/api/v1/sign-in", post(sign_in))
         .route("/api/v1/sign-out", post(sign_out))
@@ -116,6 +120,14 @@ async fn security_headers(mut req: axum::extract::Request, next: axum::middlewar
     h.insert("referrer-policy", HeaderValue::from_static("no-referrer"));
     h.insert("cache-control", HeaderValue::from_static("no-store"));
     h.insert("strict-transport-security", HeaderValue::from_static("max-age=31536000"));
+    // the console's own files only: no inline script or style, nothing from elsewhere
+    h.insert(
+        "content-security-policy",
+        HeaderValue::from_static(
+            "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; \
+             base-uri 'none'; form-action 'self'; frame-ancestors 'none'",
+        ),
+    );
     r
 }
 
@@ -614,4 +626,22 @@ async fn backup_now(State(app): State<App>, ConnectInfo(addr): ConnectInfo<Socke
     let (a, who) = (app.clone(), p.user.user_id.clone());
     tokio::spawn(async move { crate::tasks::backup_now(&a, &dir, &who).await });
     Ok(Json(json!({ "started": true })))
+}
+
+// ---- the console: four files built into the binary
+
+async fn console_index() -> Response {
+    ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], include_str!("../console/index.html")).into_response()
+}
+
+async fn console_js() -> Response {
+    ([(header::CONTENT_TYPE, "text/javascript; charset=utf-8")], include_str!("../console/console.js")).into_response()
+}
+
+async fn console_css() -> Response {
+    ([(header::CONTENT_TYPE, "text/css; charset=utf-8")], include_str!("../console/console.css")).into_response()
+}
+
+async fn console_icon() -> Response {
+    ([(header::CONTENT_TYPE, "image/svg+xml")], include_str!("../console/favicon.svg")).into_response()
 }
