@@ -127,8 +127,10 @@ async fn who(app: &App, headers: &HeaderMap, method: &Method, addr: SocketAddr) 
     auth::authenticate(app, headers, method, &addr.ip().to_string()).await
 }
 
-async fn health() -> Json<Value> {
-    Json(json!({ "ok": true, "version": crate::VERSION }))
+async fn health(State(app): State<App>) -> Json<Value> {
+    // background_jobs: this machine holds the background lease (with two manager machines, one does)
+    Json(json!({ "ok": true, "version": crate::VERSION,
+                 "background_jobs": app.leader.load(std::sync::atomic::Ordering::SeqCst) }))
 }
 
 // ---- sign-in and the account ----

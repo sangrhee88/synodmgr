@@ -355,3 +355,34 @@ async fn repository_unreachable_vs_fault() {
     let e = c.batch_execute("SELECT 1").await.err().expect("terminated");
     assert!(db::unavailable(&anyhow::Error::from(e)), "terminated");
 }
+
+/// The background lease: one holder at a time; renewals keep it; a release or an expiry hands it on.
+#[tokio::test]
+async fn background_lease() {
+    let Some(env) = start("lease").await else { return };
+    use synod_manager::lease;
+    let db = &env.app.db;
+    let ttl = std::time::Duration::from_secs(2);
+    assert!(lease::hold(db, "t", "a", ttl).await.unwrap());
+    assert!(!lease::hold(db, "t", "b", ttl).await.unwrap(), "b can't take a held lease");
+    assert!(lease::hold(db, "t", "a", ttl).await.unwrap(), "a renews");
+    assert_eq!(lease::holder(db, "t").await.unwrap().map(|h| h.0), Some("a".into()));
+    lease::release(db, "t", "b").await.unwrap();
+    assert!(!lease::hold(db, "t", "b", ttl).await.unwrap(), "only the holder releases");
+    lease::release(db, "t", "a").await.unwrap();
+    assert!(lease::hold(db, "t", "b", ttl).await.unwrap(), "after a release, b takes it at once");
+    tokio::time::sleep(std::time::Duration::from_millis(2300)).await;
+    assert!(lease::hold(db, "t", "a", ttl).await.unwrap(), "after b's lease ran out, a takes it");
+    // twenty at once: exactly one wins
+    lease::release(db, "t", "a").await.unwrap();
+    let mut set = tokio::task::JoinSet::new();
+    for i in 0..20 {
+        let d = db.clone();
+        set.spawn(async move { lease::hold(&d, "t", &format!("h{i}"), std::time::Duration::from_secs(30)).await.unwrap() });
+    }
+    let mut won = 0;
+    while let Some(r) = set.join_next().await {
+        won += r.unwrap() as i32;
+    }
+    assert_eq!(won, 1);
+}

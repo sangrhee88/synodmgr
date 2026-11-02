@@ -34,6 +34,19 @@ async fn main() -> Result<()> {
         tracing::warn!("no administrator yet: on this machine, run `synodmgr-admin init-admin` (the installer does)");
     }
     tasks::spawn_all(app.clone());
+    // a clean stop gives the background lease up, so the other manager machine takes over at once
+    let a = app.clone();
+    tokio::spawn(async move {
+        use tokio::signal::unix::{SignalKind, signal};
+        let (mut term, mut int) = (signal(SignalKind::terminate()).expect("SIGTERM"), signal(SignalKind::interrupt()).expect("SIGINT"));
+        tokio::select! { _ = term.recv() => {}, _ = int.recv() => {} }
+        if a.leader.load(std::sync::atomic::Ordering::SeqCst) {
+            let r = tokio::time::timeout(std::time::Duration::from_secs(2),
+                synod_manager::lease::release(&a.db, synod_manager::lease::BACKGROUND, &a.instance)).await;
+            info!("stopping: background lease given up ({})", if matches!(r, Ok(Ok(()))) { "ok" } else { "not reachable" });
+        }
+        std::process::exit(0);
+    });
     let router = api::router(app.clone()).into_make_service_with_connect_info::<SocketAddr>();
     match (&cfg.tls_cert, &cfg.tls_key) {
         (Some(cert), Some(key)) => {

@@ -1,8 +1,10 @@
-//! Background work: copying every installation's control plane events (every 5 s), and keeping the
+//! Background work: copying every installation's control plane events (every 5 s, by the machine
+//! holding the background lease when there are two), and keeping the
 //! metrics store's scrape configuration in step with the installations and their hosts (every
 //! 60 s). Sessions past their end are removed too, and a backup is made every night when
 //! `[backup] dir` is set.
 
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -10,7 +12,7 @@ use chrono::{DateTime, NaiveDateTime, Utc};
 use serde_json::{Value, json};
 use tracing::warn;
 
-use crate::App;
+use crate::{App, lease};
 use crate::cplane::{self, Installation};
 use crate::crypto::write_private;
 
@@ -19,11 +21,32 @@ pub fn spawn_all(app: App) {
         let a = app.clone();
         tokio::spawn(async move { nightly_backups(a, dir).await });
     }
+    // the background lease: renewed every 5 s; only its holder copies events and prunes sessions
+    let a = app.clone();
+    tokio::spawn(async move {
+        let mut t = tokio::time::interval(lease::RENEW);
+        loop {
+            t.tick().await;
+            let held = match lease::hold(&a.db, lease::BACKGROUND, &a.instance, lease::TTL).await {
+                Ok(h) => h,
+                Err(e) => {
+                    warn!("background lease: {e:#}");
+                    false
+                }
+            };
+            if held != a.leader.swap(held, Ordering::SeqCst) {
+                tracing::info!("{} the background work (events, sessions) on this machine", if held { "taking over" } else { "no longer doing" });
+            }
+        }
+    });
     let a = app.clone();
     tokio::spawn(async move {
         let mut t = tokio::time::interval(Duration::from_secs(5));
         loop {
             t.tick().await;
+            if !a.leader.load(Ordering::SeqCst) {
+                continue;
+            }
             if let Err(e) = copy_events(&a).await {
                 warn!("events: {e:#}");
             }
@@ -34,11 +57,14 @@ pub fn spawn_all(app: App) {
         let mut t = tokio::time::interval(Duration::from_secs(60));
         loop {
             t.tick().await;
+            // every machine scrapes for itself: its own metrics store, its own list
             if let Err(e) = write_scrape_config(&a).await {
                 warn!("scrape configuration: {e:#}");
             }
-            if let Err(e) = prune_sessions(&a).await {
-                warn!("sessions: {e:#}");
+            if a.leader.load(Ordering::SeqCst) {
+                if let Err(e) = prune_sessions(&a).await {
+                    warn!("sessions: {e:#}");
+                }
             }
         }
     });
@@ -52,12 +78,24 @@ pub fn parse_event_time(s: &str) -> Option<DateTime<Utc>> {
     NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f").ok().map(|n| n.and_utc())
 }
 
+/// Installations whose events are copied at once.
+pub const EVENT_COPIES_AT_ONCE: usize = 16;
+
+/// Every installation's new events, up to `EVENT_COPIES_AT_ONCE` installations at a time (one
+/// slow or unreachable control plane doesn't hold up the others).
 pub async fn copy_events(app: &App) -> Result<()> {
+    let mut set = tokio::task::JoinSet::new();
+    let limit = std::sync::Arc::new(tokio::sync::Semaphore::new(EVENT_COPIES_AT_ONCE));
     for inst in cplane::installations(app).await? {
-        if let Err(e) = copy_events_of(app, &inst).await {
-            warn!(installation = %inst.name, "events: {e:#}");
-        }
+        let (a, l) = (app.clone(), limit.clone());
+        set.spawn(async move {
+            let _p = l.acquire_owned().await;
+            if let Err(e) = copy_events_of(&a, &inst).await {
+                warn!(installation = %inst.name, "events: {e:#}");
+            }
+        });
     }
+    while set.join_next().await.is_some() {}
     Ok(())
 }
 

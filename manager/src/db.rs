@@ -113,6 +113,14 @@ CREATE TABLE IF NOT EXISTS events (
     PRIMARY KEY (installation, id)
 );
 CREATE INDEX IF NOT EXISTS events_at ON events (at DESC);
+
+-- Work only one manager machine may do at a time (copying events, removing old sessions): the
+-- machine holding the lease does it, renewing it every few seconds; times are the database's.
+CREATE TABLE IF NOT EXISTS leases (
+    name   text PRIMARY KEY,
+    holder text NOT NULL,
+    until  timestamptz NOT NULL
+);
 "#;
 
 pub async fn migrate(db: &Db) -> Result<()> {

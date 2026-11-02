@@ -22,6 +22,10 @@ Milestone 1, step 3 of the order of work: the manager service, without the conso
   control planes' events copied every 5 s, the scrape configuration for VictoriaMetrics, and a
   nightly backup (`manager/src/backup.rs`: the repository, the metrics, the key file and audit anchor,
   in one AES-256-GCM-encrypted file; 7 days kept).
+- One or two manager machines: both serve the API on the shared repository and each scrapes
+  everything into its own metrics store; copying events and removing old sessions is done by the
+  machine holding a lease in the repository (`manager/src/lease.rs`: 15 s, renewed every 5 s, given up
+  on a clean stop), so losing either machine loses neither the console nor the metrics.
 - `synodmgr-admin` on the manager machine: `init-admin`, `reset-password`, `verify-audit`,
   `add-installation`, `backup`, `backups`, `restore FILE`.
 - `synod-install` (sangrhee88/stage3-neon-m1, branch `manager`) installs it as role `manager`.
@@ -38,13 +42,14 @@ Next: the console pages and the `synodmgr` CLI (step 4).
 Packed into the Synod build with `synod-install package --neon-dir <synod-storage> --manager-dir <this
 checkout>`; a machine with role `manager` in the inventory gets it (`installer/test/local3-manager.toml`,
 checked by `installer/test/manager_check.py`, `manager_failover.py` (the repository's writer killed)
-and `manager_backup_check.py` (everything lost, reinstalled, restored)).
+`manager_backup_check.py` (everything lost, reinstalled, restored) and, with two manager machines
+(`local3-manager2.toml`), `manager_ha_check.py` (one machine lost)).
 
 ## Layout
 
 - `manager/src/config.rs` the configuration file (`/etc/synodmgr/manager.toml`, written by the installer)
 - `manager/src/db.rs` the repository schema
-- `manager/src/backup.rs` backups and restore
+- `manager/src/backup.rs` backups and restore; `lease.rs` the background lease (two machines)
 - `manager/src/auth.rs`, `passwords.rs`, `users.rs` sign-in, sessions, accounts
 - `manager/src/audit.rs` the audit log
 - `manager/src/cplane.rs` the control plane client; `tasks.rs` events and scrape configuration

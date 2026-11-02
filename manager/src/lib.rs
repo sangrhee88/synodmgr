@@ -9,11 +9,13 @@ pub mod config;
 pub mod cplane;
 pub mod crypto;
 pub mod db;
+pub mod lease;
 pub mod passwords;
 pub mod tasks;
 pub mod users;
 
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -27,6 +29,10 @@ pub struct AppState {
     /// here instead of using up the machine's memory.
     pub hashing: tokio::sync::Semaphore,
     pub http: reqwest::Client,
+    /// This process, as a lease holder: host, address and a random part (a restart is a new holder).
+    pub instance: String,
+    /// Whether this machine holds the background lease (it copies events and removes old sessions).
+    pub leader: AtomicBool,
 }
 
 pub type App = Arc<AppState>;
@@ -40,6 +46,8 @@ impl AppState {
             .user_agent(concat!("synod-manager/", env!("CARGO_PKG_VERSION")))
             .build()?;
         let audit = audit::Audit::new(db.clone(), secrets.audit_key(), Some(cfg.data_dir.join("audit-anchor")));
+        let host = std::fs::read_to_string("/proc/sys/kernel/hostname").map(|s| s.trim().to_string()).unwrap_or_default();
+        let instance = format!("{host}/{}/{}", cfg.listen, &crypto::new_token()[..8]);
         Ok(Arc::new(AppState {
             cfg,
             db,
@@ -48,6 +56,8 @@ impl AppState {
             throttle: auth::Throttle::default(),
             hashing: tokio::sync::Semaphore::new(4),
             http,
+            instance,
+            leader: AtomicBool::new(false),
         }))
     }
 }
