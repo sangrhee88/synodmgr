@@ -14,6 +14,7 @@ You confirmed all four decisions below on Nov 1.
 | Form | Web console and CLI, both on one API; the console ships in milestone 1 | Confirmed by you on Nov 1. Every action is scriptable, and the console can never do something the CLI can't |
 | Where it runs | A new VM next to the cluster, in the customer's network | Confirmed by you on Nov 1: next to the cluster it can collect every metric. Pilot machines have no inbound internet access, and Oracle RAC shops run OEM themselves. It ships with `synod-install` and runs on any Linux machine with no AWS service needed; the same build becomes a Synod-hosted cloud in 2027 |
 | Who uses it | Admin and Viewer roles plus an audit log from day one; SSO (OIDC) in milestone 2 | Confirmed by you on Nov 1. Today one shared token can do everything, with no record of who did what |
+| Sign-in | Every person signs in to the console with their own user ID and password, and can change the password themselves; in milestone 1 | Asked for by you on Nov 1. It needs no outside identity service; SSO (OIDC) comes beside it in milestone 2 |
 | First milestone | Read-only fleet and performance views | Confirmed by you on Nov 1. Safe to give pilots early: it adds no new way to break a cluster |
 
 ## What it is, in Oracle terms
@@ -186,15 +187,27 @@ Milestone 4 starts once milestones 1 to 3 hold up at the first design partner. B
 - **Advisors.** Index, VACUUM (undo-aware) and plan-regression advisors over the per-query statistics.
 - **No gaps.** A standby manager, upgrades without a gap in monitoring, and 15-month history as an option.
 
-## Access, audit log and SSO
+## Access, sign-in, audit log and SSO
 
 People sign in to the manager, never to cplane. The manager is the only holder of each installation's cplane admin token, so its roles and audit log can't be bypassed once that token is rotated.
 
 - **Roles.** Admin runs every action; Viewer sees every page and nothing else. Per-cluster scoping (an app team sees only its clusters) comes when a customer asks.
-- **Sign-in.** Milestone 1: local accounts and API tokens for `synodmgr` and scripts. Milestone 2: SSO through OIDC (Okta, Microsoft Entra ID, Google); SAML only if a customer needs it.
+- **Sign-in.** Milestone 1: every person signs in with their own user ID and password and can change the password themselves (details below), plus API tokens for `synodmgr` and scripts. Milestone 2: SSO through OIDC (Okta, Microsoft Entra ID, Google) beside it; SAML only if a customer needs it.
 - **Audit log.** One append-only row per action and per sign-in: who, when, from where, the action, its target, the request with secrets removed, the result, and the cplane event ids it caused. Each row carries a hash of the previous one, so a removed or edited row is detectable. Auditors get a read-only export (CSV or JSON).
 - **Secrets.** cplane tokens and database passwords are stored encrypted. The key stays on the manager machine, readable only by its service (like the installer's secrets file today). No cloud secret store is needed; one can be plugged in later.
 - **SQL access to writers.** Read-only pages use a `synod_monitor` role with `pg_monitor` rights, over TLS checked against the cluster CA (`GET /v1/ca.crt`). Cancelling or ending sessions uses a separate role, used only for Admin jobs.
+
+**User ID and password (milestone 1).** The console opens on a sign-in page and shows nothing until you sign in. The same accounts work for `synodmgr login`. The rules follow NIST SP 800-63B Revision 4 (August 2025; [summary](https://www.enzoic.com/blog/nist-sp-800-63b-rev4/)).
+
+- **First admin.** The installer creates the user `admin` with a one-time password, in a file only root can read on the manager machine. The first sign-in must set a new password.
+- **Adding people.** An Admin adds a user ID, a name and a role (Admin or Viewer) with a temporary password, which the person must change at first sign-in. Admins can also reset a password the same way, unlock or disable a user, and end their sessions. No one can see anyone's password.
+- **Changing your own password.** Every user, Viewers included, from the account page or `synodmgr passwd`: the current password once, the new one twice. The user's other sessions are then signed out.
+- **Password rules.** 15 to 128 characters, any characters including spaces, not the user ID, and not on a bundled list of common and breached passwords. No forced symbols and no scheduled changes; a customer whose policy needs an expiry can set one.
+- **Storage.** Only an Argon2id hash of each password is kept, in the manager's own database. Passwords never appear in logs, the audit log or API answers.
+- **Wrong passwords.** After 10 failures in a row the account waits 15 minutes, and many failures from one address slow that address down. The message never says whether the user ID exists.
+- **Sessions.** HTTPS only, with a certificate from the cluster CA or the customer's own. The session cookie can't be read by page scripts or sent from other sites. Signed out after 30 minutes idle and 12 hours at most; `synodmgr login` tokens also last 12 hours.
+- **Recorded.** Every sign-in, failed attempt, sign-out, password change, reset, unlock and user change goes in the audit log.
+- **Every admin locked out.** On the manager machine, root runs `synodmgr-admin reset-password admin` for a new one-time password; that is recorded too.
 
 ## Changes needed in Synod
 
@@ -257,8 +270,8 @@ Milestone 1 is about three weeks of work by my estimate; milestones 2 and 3 abou
 
 1. **cplane read endpoints** (about 2 days): cluster list, events after an id, `/metrics`. Unit tests in `cplane`. Done Nov 1 on branch `manager-api` of synod-storage (built on `pooler`, not merged): unit and store tests pass, and 27 of 27 end-to-end checks with a leader and a standby.
 2. **Collectors** (about 3 days): the host agent serves every writer's metrics; the installer adds Ubuntu's `node_exporter`, the metrics token and a `targets` command. The `manager` role and the `synod_monitor` role move to step 3, where the manager first needs them. Then the local correctness suite, since this is the one change on writer machines.
-3. **Manager core** (about 4 days): API, its own database (installations, users, tokens, audit log), VictoriaMetrics with targets taken from cplane. Also the installer's manager role and the synod_monitor role, moved here from step 2.
-4. **Console and CLI** (about 1 to 1.5 weeks): the seven pages, and `synodmgr` read commands (`status`, `clusters`, `events`, `sessions`).
+3. **Manager core** (about 5 days): API, its own database (installations, users, tokens, audit log), VictoriaMetrics with targets taken from cplane. Sign-in with a user ID and password: the first admin, adding users, changing and resetting passwords, lockout and sessions, each with its audit row. Also the installer's manager role and the synod_monitor role, moved here from step 2.
+4. **Console and CLI** (about 1 to 1.5 weeks): the seven pages, the sign-in page and an account page (change password; Admins also manage users), and `synodmgr` commands (`login`, `passwd`, `status`, `clusters`, `events`, `sessions`).
 5. **Test locally**: a three-writer cluster from `local3-run.sh`, then the existing fault tests (kill, freeze, network split, machine loss), checking that each shows on the Events and Cluster pages within 10 s.
 6. **Test on AWS** (asks you first; it costs money): one run on the 7-machine layout to measure the exporters' cost to throughput with the warm-cache benchmark, and to size the manager machine. Results collected before teardown; machines terminated and counted to 0.
 7. **Milestone 2**: the job runner and actions, OIDC sign-in, scoped cplane tokens, job ids in events. Each action tested against a live local cluster, including a second job refused while one runs.
@@ -279,6 +292,6 @@ Questions before code starts, answered Nov 1:
 
 - [x] Is the name **Synod Manager** (`synodmgr`) right? Yes: the code lives in sangrhee88/synodmgr (private, created Nov 1).
 - [x] Is the manager in the paid product only, or also in a free Community edition? Marketplace allows a free edition only beside a paid one. Answer: both, a free Community edition beside the paid one (split proposed under Packaging).
-- [x] Which alert destinations and sign-in provider does the first design partner use (Slack, PagerDuty, email; Okta, Entra ID)? Answer: Slack and email for alerts. The sign-in provider is still open; OIDC covers the common ones.
+- [x] Which alert destinations and sign-in provider does the first design partner use (Slack, PagerDuty, email; Okta, Entra ID)? Answer: Slack and email for alerts. Sign-in (Nov 1, 20:50): you asked for a user ID and password that each user can change; that is in milestone 1 (Access, sign-in, audit log and SSO). OIDC adds the common providers in milestone 2.
 - [x] Is a Synod-hosted cloud a 2027 goal, or customer-hosted only for now? Answer: yes, a 2027 goal.
 - [x] OK to collect metrics next to every writer? It is the only change on writer machines. Answer: yes, so each writer's performance shows on its own.
