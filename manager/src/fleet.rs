@@ -32,6 +32,9 @@ pub struct Snapshot {
     pub leader: Result<Value, String>,
     pub clusters: Result<Value, String>,
     pub hosts: Result<Value, String>,
+    /// One-writer databases (not a cluster's writer slots), when the control plane lists them.
+    /// Not counted as a problem when missing (older control planes, simulated fleets).
+    pub databases: Option<Value>,
     /// The last hosts list the control plane gave (kept through a failed refresh, so a passing
     /// error doesn't drop host agents from the scrape list).
     pub last_hosts: Option<Value>,
@@ -52,6 +55,7 @@ impl Snapshot {
             "control_plane": self.leader.as_ref().ok(),
             "clusters": self.clusters.as_ref().ok(),
             "hosts": self.hosts.as_ref().ok(),
+            "databases": self.databases,
             "errors": self.errors(),
             "as_of": self.at,
             "age_s": (age * 10.0).round() / 10.0,
@@ -119,7 +123,7 @@ pub async fn fetch(app: &App, inst: &Installation) -> Snapshot {
     let t0 = Instant::now();
     let (fd, tok) = (inst.front_door.as_str(), inst.admin_token.as_str());
     let work = async {
-        let (leader, clusters, hosts, metrics) = tokio::join!(
+        let (leader, clusters, hosts, metrics, databases) = tokio::join!(
             cplane::get_json(app, fd, tok, "/v1/leader"),
             cplane::get_json(app, fd, tok, "/v1/clusters"),
             cplane::get_json(app, fd, tok, "/v1/hosts"),
@@ -130,12 +134,13 @@ pub async fn fetch(app: &App, inst: &Installation) -> Snapshot {
                     None
                 }
             },
+            cplane::get_json(app, fd, tok, "/v1/databases"),
         );
-        (leader, clusters, hosts, metrics)
+        (leader, clusters, hosts, metrics, databases.ok())
     };
     let e = |r: Result<Value>| r.map_err(|e| format!("{e:#}"));
-    let (leader, mut clusters, hosts) = match tokio::time::timeout(TIMEOUT, work).await {
-        Ok((l, c, h, m)) => {
+    let (leader, mut clusters, hosts, databases) = match tokio::time::timeout(TIMEOUT, work).await {
+        Ok((l, c, h, m, d)) => {
             let mut c = e(c);
             if let (Ok(Value::Array(list)), Some(text)) = (&mut c, m) {
                 let ages: BTreeMap<String, f64> = cplane::restore_point_ages(&text);
@@ -144,11 +149,12 @@ pub async fn fetch(app: &App, inst: &Installation) -> Snapshot {
                     cl["restore_point_age_s"] = json!(ages.get(&name));
                 }
             }
-            (e(l), c, e(h))
+            let d = d.map(|d| single_writer_databases(&d, c.as_ref().ok()));
+            (e(l), c, e(h), d)
         }
         Err(_) => {
             let t = format!("no answer within {} s", TIMEOUT.as_secs());
-            (Err(t.clone()), Err(t.clone()), Err(t))
+            (Err(t.clone()), Err(t.clone()), Err(t), None)
         }
     };
     if matches!(&clusters, Ok(v) if !v.is_array()) {
@@ -161,9 +167,31 @@ pub async fn fetch(app: &App, inst: &Installation) -> Snapshot {
         leader,
         clusters,
         hosts,
+        databases,
         at: Utc::now(),
         took_ms: t0.elapsed().as_millis() as u64,
     }
+}
+
+/// The control plane's database list without the clusters' writer slots: those it marks with
+/// their cluster, and (older control planes) those named as a cluster's slot.
+fn single_writer_databases(list: &Value, clusters: Option<&Value>) -> Value {
+    let slots: std::collections::HashSet<&str> = clusters
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .flat_map(|c| c.get("slots").and_then(Value::as_array).into_iter().flatten())
+        .filter_map(|s| s.get("slot").and_then(Value::as_str))
+        .collect();
+    Value::Array(
+        list.as_array()
+            .into_iter()
+            .flatten()
+            .filter(|d| d.get("cluster").is_none_or(Value::is_null))
+            .filter(|d| d.get("name").and_then(Value::as_str).is_some_and(|n| !slots.contains(n)))
+            .cloned()
+            .collect(),
+    )
 }
 
 /// Refreshes one installation's entry (nothing if it is being refreshed already).
@@ -224,7 +252,16 @@ pub async fn view(app: &App, only: Option<&str>) -> Result<Vec<Value>> {
             refresh_one(app, &inst).await;
         }
         match app.fleet.get(inst.id).await {
-            Some(s) => out.push(s.to_json()),
+            Some(s) => {
+                let mut v = s.to_json();
+                // the manager's own repository: the console offers no Stop for it
+                if let (Some(repo), Some(list)) = (app.cfg.repository_dbname(), v["databases"].as_array_mut()) {
+                    for d in list.iter_mut().filter(|d| d["name"].as_str() == Some(repo.as_str())) {
+                        d["repository"] = json!(true);
+                    }
+                }
+                out.push(v)
+            }
             // being fetched by the background refresh this moment
             None => out.push(json!({ "installation": inst.name, "front_door": inst.front_door,
                                      "errors": ["not fetched yet; try again in a moment"] })),

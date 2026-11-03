@@ -157,6 +157,13 @@ impl Config {
     pub fn https(&self) -> bool {
         self.tls_cert.is_some()
     }
+
+    /// The manager's own repository database's name (a one-writer Synod database, usually
+    /// synodmgr): the console and API won't stop it, since a stopped repository stops the manager.
+    pub fn repository_dbname(&self) -> Option<String> {
+        let cfg: tokio_postgres::Config = self.database_url.parse().ok()?;
+        cfg.get_dbname().map(str::to_string)
+    }
 }
 
 #[cfg(test)]

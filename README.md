@@ -36,7 +36,17 @@ Milestone 1, step 3 of the order of work: the manager service, without the conso
   `add-installation`, `backup`, `backups`, `restore FILE`.
 - `synod-install` (sangrhee88/stage3-neon-m1, branch `manager`) installs it as role `manager`.
 
-Next: the console pages and the `synodmgr` CLI (step 4).
+- Console (step 4, under way): sign-in and the first password change, Fleet (clusters, writers,
+  one-writer databases, hosts), Sessions, Events, Users, Backups, Your account.
+- Operator actions, asked for ahead of milestone 2 (`manager/src/api/actions.rs`, control plane API
+  level 2): stop, start and restart a one-writer database, one cluster writer or a whole cluster (a
+  rolling restart, one writer at a time, each back in the cluster before the next); every writer's
+  sessions in one list, with cancel and end session. Stop and restart need the target's name typed,
+  a stop needs a reason; Admins only (Viewers may list sessions); each one is audited and its
+  control plane events carry the user's ID. The manager won't stop its own repository.
+  Checked by `manager_actions_check.py`, and the control plane side under load by `fleet_check.py`.
+
+Next: the remaining console pages, the `synodmgr` CLI, and patching (a rolling Synod upgrade).
 
 ## Build and test
 

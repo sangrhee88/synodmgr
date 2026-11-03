@@ -1,5 +1,6 @@
 //! The Synod installations the manager watches, and the control plane API it reads them through
-//! (cplane API level 1: `/v1/version`, `/v1/clusters`, `/v1/events?after=`, `/v1/hosts`, `/metrics`).
+//! (cplane API level 1: `/v1/version`, `/v1/clusters`, `/v1/events?after=`, `/v1/hosts`, `/metrics`;
+//! level 2 adds operator actions and sessions, see api/actions.rs).
 
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
@@ -78,6 +79,26 @@ pub async fn get_json(app: &App, front_door: &str, token: &str, path: &str) -> R
         bail!("GET {path}: {status}: {}", text.chars().take(300).collect::<String>());
     }
     serde_json::from_str(&text).with_context(|| format!("GET {path}: not JSON"))
+}
+
+/// Any control plane call with the installation's admin token and its own timeout (operator
+/// actions take minutes): (status, body). Only a failure to get an answer is an error.
+pub async fn request(
+    app: &App,
+    method: reqwest::Method,
+    front_door: &str,
+    token: &str,
+    path: &str,
+    body: Option<&Value>,
+    timeout: std::time::Duration,
+) -> Result<(u16, String)> {
+    let mut req = app.http.request(method.clone(), url(front_door, path)).bearer_auth(token).timeout(timeout);
+    if let Some(b) = body {
+        req = req.json(b);
+    }
+    let r = req.send().await.with_context(|| format!("{method} {path}"))?;
+    let status = r.status().as_u16();
+    Ok((status, r.text().await?))
 }
 
 /// GET text (the control plane's /metrics) with a token.

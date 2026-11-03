@@ -7,6 +7,10 @@
 //! Administrators: `GET/POST /api/v1/users`, `PATCH /api/v1/users/{id}`,
 //! `POST /api/v1/users/{id}/reset-password|unlock|sign-out`, `POST /api/v1/installations`,
 //! `DELETE /api/v1/installations/{name}`, `GET/POST /api/v1/backups`.
+//! Operator actions (api/actions.rs): sessions (`GET .../clusters/{c}/sessions`, `GET
+//! .../databases/{d}/sessions`: signed in); `POST` stop, start, restart of
+//! `.../databases/{d}`, `.../clusters/{c}/slots/{s}` and `.../clusters/{c}`, and cancel or
+//! terminate of a session (Administrators), all under `/api/v1/installations/{name}`.
 
 use std::net::SocketAddr;
 
@@ -17,6 +21,8 @@ use axum::routing::{delete, get, patch, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{Value, json};
+
+mod actions;
 
 use crate::App;
 use crate::audit::{self, Entry};
@@ -96,6 +102,14 @@ pub fn router(app: App) -> Router {
         .route("/api/v1/audit", get(audit_list))
         .route("/api/v1/audit/verify", get(audit_verify))
         .route("/api/v1/backups", get(list_backups).post(backup_now))
+        // operator actions and sessions (api/actions.rs)
+        .route("/api/v1/installations/{inst}/databases/{db}/sessions", get(actions::database_sessions))
+        .route("/api/v1/installations/{inst}/databases/{db}/sessions/{pid}/{action}", post(actions::kill_database_session))
+        .route("/api/v1/installations/{inst}/databases/{db}/{action}", post(actions::database_action))
+        .route("/api/v1/installations/{inst}/clusters/{cluster}/sessions", get(actions::cluster_sessions))
+        .route("/api/v1/installations/{inst}/clusters/{cluster}/sessions/{slot}/{pid}/{action}", post(actions::kill_cluster_session))
+        .route("/api/v1/installations/{inst}/clusters/{cluster}/slots/{slot}/{action}", post(actions::writer_action))
+        .route("/api/v1/installations/{inst}/clusters/{cluster}/{action}", post(actions::cluster_action))
         .fallback(not_found)
         .layer(axum::middleware::from_fn(security_headers))
         .with_state(app)
